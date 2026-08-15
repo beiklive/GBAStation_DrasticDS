@@ -10,22 +10,19 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-TARGET		:=	$(notdir $(CURDIR))
-APP_TITLE	:=	Drastic DS
-APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.7
+TARGET		:=	GBAStationDrasticStub
+APP_TITLE	:=	GBAStation Drastic Stub
+APP_AUTHOR	:=	beiklive
+APP_VERSION	:=	0.0.1
 BUILD		:=	build
-SOURCES		:=	source source/hooks source/switch
+SOURCES		:=	source source/hooks
 DATA		:=	data
-INCLUDES	:=	source source/switch
+INCLUDES	:=	source
 DFX_GENERATED ?=
 ifneq ($(strip $(DFX_GENERATED)),)
 DATA		+=	$(DFX_GENERATED)/data
 INCLUDES	+=	$(DFX_GENERATED)/include
 endif
-STORAGE_BUILD ?= $(TOPDIR)/launcher/dependencies/build
-LIBSMB2_INCLUDE ?= $(STORAGE_BUILD)/_deps/libsmb2-src/include
-LIBUSBHSFS_INCLUDE ?= $(STORAGE_BUILD)/_deps/libusbhsfs-src/include
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -34,77 +31,29 @@ ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 OPTIMIZATION := -O3 -flto=auto
 
 # __SWITCH__ for libnx; DRASTIC_NX gates the port-specific host branches.
-DEFINES	:=	-D__SWITCH__ -DDRASTIC_NX -DDRASTIC_NX_VERSION='"$(APP_VERSION)"'
+DEFINES	:=	-D__SWITCH__ -D_GNU_SOURCE -DDRASTIC_NX -DDRASTIC_NX_VERSION='"$(APP_VERSION)"'
 ifneq ($(strip $(DFX_GENERATED)),)
 DEFINES	+=	-DDRASTIC_DFX_GENERATED
 endif
 
-# --- renderer select: GL (default) or VK (Mesa NVK) ------------------------
-# GL and Vulkan are mutually exclusive (switch-mesa's libEGL/GLES and the NVK
-# archives both bundle mesa util/nir/compiler object code -> can't co-link).
-#   make             -> OpenGL (switch-mesa GLES, unchanged)
-#   make RENDERER=VK -> Vulkan (Mesa NVK, vendored flat under vulkan/)
-RENDERER ?= GL
-ifeq ($(RENDERER),VK)
-DEFINES	+=	-DUSE_VULKAN -DVK_USE_PLATFORM_VI_NN
-VULKAN_STAGE ?= $(TOPDIR)/vulkan
-VULKAN_INCLUDE ?= third_party/vulkan-headers/include
-SOURCES	+=	source/lsfg \
-			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
-			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
-			third_party/lsfg-vk/lsfg-vk-backend/src \
-			third_party/lsfg-vk/lsfg-vk-backend/src/extraction \
-			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
-			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
-INCLUDES	+=	source/lsfg \
-			$(VULKAN_INCLUDE) \
-			third_party/lsfg-vk/lsfg-vk-common/include \
-			third_party/lsfg-vk/lsfg-vk-backend/include \
-			third_party/lsfg-vk/lsfg-vk-backend/src
-else
+# This project now ships one standalone OpenGL host only.
 DEFINES	+=	-DUSE_OPENGL
-endif
 
 CFLAGS	:=	-Wall -Wextra $(OPTIMIZATION) -DNDEBUG -ffunction-sections -fdata-sections \
 			-fno-ident -ffile-prefix-map=$(CURDIR)=. \
 			-fmacro-prefix-map=$(CURDIR)=. $(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
 CXXFLAGS	:= $(CFLAGS) -Wno-missing-field-initializers
-ifeq ($(RENDERER),VK)
-CXXFLAGS	+= -std=gnu++20
-endif
 
 ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(OPTIMIZATION) -Wl,-Map,$(notdir $*.map) \
 			-Wl,--gc-sections -Wl,--build-id=sha1
 
-STORAGE_LIBS := $(STORAGE_BUILD)/_deps/libsmb2-build/lib/libsmb2.a \
-				$(STORAGE_BUILD)/_deps/libusbhsfs-build/liblibusbhsfs.a
-
 # nx supplies audren, HID, applet, and filesystem services. Drastic's OpenSL ES
 # ABI is implemented directly by the audren-backed source/opensles.c layer.
-ifeq ($(RENDERER),VK)
-# Mesa NVK: 23 vendored static archives (vulkan/lib) linked in one --start-group
-# (circular NVK<->runtime<->nir<->compiler deps). -l:libX.a links by exact file
-# name (avoids the -lvulkan GROUP-script + the double-prefixed liblibnil...a).
-# -lz/-lzstd resolve crc32/ZSTD_*; the DRM/nouveau_ws path is dead-stripped so no
-# -ldrm_nouveau. -lstdc++/libgcc unwinder are needed by NAK's bundled Rust.
-LIBDIRS	:= $(VULKAN_STAGE) $(PORTLIBS) $(LIBNX)
-LIBS	:= -Wl,--start-group \
-		-l:libnvk.a -l:libvulkan_lite_runtime.a -l:libvulkan_runtime.a \
-		-l:libvulkan_lite_instance.a -l:libvulkan_instance.a \
-		-l:libvulkan_util.a -l:libvulkan_wsi.a \
-		-l:libnak.a -l:libnak_rs.a -l:libvtn.a -l:libxmlconfig.a \
-		-l:libnil.a -l:liblibnil_format_table.a -l:libnouveau_mme.a \
-		-l:libnouveau_ws.a -l:libnvidia_headers_c.a \
-		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
-		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
-		-Wl,--end-group $(STORAGE_LIBS) -lminizip -lz -lzstd -lnx -lstdc++ -lm
-else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lminizip -lz -lnx -lstdc++ -lm
-endif
+LIBS	:= -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lminizip -lz -lnx -lstdc++ -lm
 
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -135,23 +84,12 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 
 export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(call absolute_or_local,$(dir))) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-			-I$(LIBSMB2_INCLUDE) -I$(LIBUSBHSFS_INCLUDE) \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
-ifeq ($(strip $(ICON)),)
-	icons := $(wildcard *.jpg)
-	ifneq (,$(findstring $(TARGET).jpg,$(icons)))
-		export APP_ICON := $(TOPDIR)/$(TARGET).jpg
-	else
-		ifneq (,$(findstring icon.jpg,$(icons)))
-			export APP_ICON := $(TOPDIR)/icon.jpg
-		endif
-	endif
-else
-	export APP_ICON := $(TOPDIR)/$(ICON)
-endif
+
+export APP_ICON := $(TOPDIR)/icon.png
 
 ifeq ($(strip $(NO_ICON)),)
 	export NROFLAGS += --icon=$(APP_ICON)
@@ -178,9 +116,7 @@ $(BUILD):
 clean:
 	@echo clean ...
 	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf \
-		$(TARGET)_gl.nro $(TARGET)_gl.elf $(TARGET)_gl.map \
-		$(TARGET)_vk.nro $(TARGET)_vk.elf $(TARGET)_vk.map \
-		DrasticDS.nro vulkan
+		GBAStationDrasticStub.nro GBAStationDrasticStub.elf GBAStationDrasticStub.map
 	@rm -f *.o
 
 #---------------------------------------------------------------------------------

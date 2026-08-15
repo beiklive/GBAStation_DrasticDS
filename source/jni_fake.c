@@ -355,7 +355,7 @@ static void *stringset_for_key(const char *key) {
 /* Drastic's native filesystem uses two Java-owned virtual roots.  "DraStic"
  * is the application data root: the core itself appends system/, config/,
  * etc.  Mapping it directly to SYSTEM_DIR would turn
- * DraStic/system/foo into /switch/drastic/system/system/foo. */
+ * DraStic/system/foo into GBAStation/drastic/system/system/foo. */
 static int drastic_real_path(const char *virtual_path, char *output,
                              size_t output_size) {
   if (!virtual_path || !output || !output_size) return 0;
@@ -366,8 +366,7 @@ static int drastic_real_path(const char *virtual_path, char *output,
   else if (virtual_path[0] == '/')
     snprintf(output, output_size, "%s", virtual_path);
   else {
-    /* USB and SMB mounts use libnx fsdev paths such as ums0:/ and
-     * drastic_smb_x:/; preserve those device-qualified ROM paths. */
+    /* Preserve device-qualified paths supplied by the core. */
     const char *colon = strchr(virtual_path, ':');
     if (!colon || colon == virtual_path || colon[1] != '/') return 0;
     for (const char *cursor = virtual_path; cursor < colon; cursor++)
@@ -379,13 +378,10 @@ static int drastic_real_path(const char *virtual_path, char *output,
   return 1;
 }
 
-/* The Android frontend installs system resources beside the selected DraStic
- * data directory.  The native cheat manager is the one exception to otherwise
- * immutable resources: it reopens usrcheat.dat with "rb+" to persist toggles
- * before rebuilding its active-code list.  Keep that file on the launcher's
- * documented SYSTEM_DIR path for both reads and writes.  Other resources only
- * use SYSTEM_DIR as a read-only fallback, so saves and user writes retain their
- * virtual-root locations. */
+/* The Android frontend uses its virtual DraStic directory for most resources.
+ * The standalone host keeps user-supplied BIOS, firmware and cheat data in the
+ * shared GBAStation layout, while the remaining resources stay under
+ * SYSTEM_DIR. */
 static void drastic_resource_path(const char *virtual_path, const char *mode,
                                   char *real_path,
                                   size_t real_path_size) {
@@ -400,8 +396,31 @@ static void drastic_resource_path(const char *virtual_path, const char *mode,
   if (!relative || !*relative)
     return;
 
-  if (!strcmp(relative, "usrcheat.dat")) {
-    snprintf(real_path, real_path_size, "%s/usrcheat.dat", SYSTEM_DIR);
+  if (!strcmp(relative, "usrcheat.dat") ||
+      !strcmp(relative, "system/usrcheat.dat")) {
+    snprintf(real_path, real_path_size, "%s", CHEAT_DATABASE_PATH);
+    return;
+  }
+
+  if (!strcmp(relative, "system/nds_bios_arm7.bin") ||
+      !strcmp(relative, "nds_bios_arm7.bin") ||
+      !strcmp(relative, "system/drastic_bios_arm7.bin") ||
+      !strcmp(relative, "drastic_bios_arm7.bin")) {
+    snprintf(real_path, real_path_size, "%s/bios7.bin", NDS_BIOS_DIR);
+    return;
+  }
+  if (!strcmp(relative, "system/nds_bios_arm9.bin") ||
+      !strcmp(relative, "nds_bios_arm9.bin") ||
+      !strcmp(relative, "system/drastic_bios_arm9.bin") ||
+      !strcmp(relative, "drastic_bios_arm9.bin")) {
+    snprintf(real_path, real_path_size, "%s/bios9.bin", NDS_BIOS_DIR);
+    return;
+  }
+  if (!strcmp(relative, "system/nds_firmware.bin") ||
+      !strcmp(relative, "nds_firmware.bin") ||
+      !strcmp(relative, "system/nds_firmware_modified.bin") ||
+      !strcmp(relative, "nds_firmware_modified.bin")) {
+    snprintf(real_path, real_path_size, "%s/firmware.bin", NDS_BIOS_DIR);
     return;
   }
 

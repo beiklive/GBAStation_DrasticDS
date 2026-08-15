@@ -44,7 +44,6 @@
 #include "hooks.h"
 #include "dl_emu.h"
 #include "opensles.h"
-#include "drastic_vk_capture.h"
 
 // crt/newlib-provided symbols forwarded by address
 int *__errno(void);
@@ -255,17 +254,9 @@ static int c_isxdigit(int c) { return isxdigit(c); }
 static int c_tolower(int c) { return tolower(c); }
 static int c_toupper(int c) { return toupper(c); }
 
-#ifdef USE_VULKAN
-#define DRASTIC_GL_IMPORT(name) ((uintptr_t)&ret0)
-#define DRASTIC_GL_BIND_TEXTURE_IMPORT \
-  ((uintptr_t)&drastic_vk_capture_gl_bind_texture)
-#define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT \
-  ((uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d)
-#else
 #define DRASTIC_GL_IMPORT(name) ((uintptr_t)&name)
 #define DRASTIC_GL_BIND_TEXTURE_IMPORT ((uintptr_t)&glBindTexture)
 #define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT ((uintptr_t)&glTexSubImage2D)
-#endif
 
 // ---------------------------------------------------------------------------
 // import table

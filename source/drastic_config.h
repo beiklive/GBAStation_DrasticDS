@@ -53,14 +53,12 @@ typedef struct {
 typedef struct {
   char rom_path[1024];
   char core_path[256];
-  char launcher_path[1024];
   char firmware_nickname[32];
   DrasticLayoutMode layout;
   int swap_screens;
   int rotation;
   int screen_gap;
   int integer_scale;
-  int vulkan_low_latency;
   DrasticVideoFilter video_filter;
   char custom_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
   int show_fps;

@@ -1,5 +1,3 @@
-#ifndef USE_VULKAN
-
 #include <switch.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -966,13 +964,3 @@ void drastic_renderer_shutdown(void) {
 
 unsigned drastic_renderer_frame_count(void) { return g_frames; }
 
-bool drastic_renderer_lsfg_available(void) { return false; }
-
-bool drastic_renderer_lsfg_enabled(void) { return false; }
-
-bool drastic_renderer_lsfg_request_enabled(bool enabled) {
-  (void)enabled;
-  return false;
-}
-
-#endif

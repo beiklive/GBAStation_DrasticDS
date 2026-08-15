@@ -31,7 +31,6 @@
 #include "prefs.h"
 #include "pthr.h"
 #include "so_util.h"
-#include "switch/SwitchStorageBridge.h"
 #include "util.h"
 
 static void *heap_so_base;
@@ -57,10 +56,6 @@ static int configure_core_jit(so_module *mod) {
   return drastic_jit_install(mod);
 }
 
-#ifdef USE_VULKAN
-u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
-#endif
-
 void __libnx_initheap(void) {
   void *address;
   size_t size = 0;
@@ -73,9 +68,6 @@ void __libnx_initheap(void) {
     svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     if (available > used + 0x200000)
       size = (available - used - 0x200000) & ~(size_t)0x1fffff;
-    const size_t gpu_reserve = (size_t)GPU_RESERVE_MB * 1024 * 1024;
-    if (size > gpu_reserve + 384 * 1024 * 1024)
-      size = (size - gpu_reserve) & ~(size_t)0x1fffff;
     if (!size) size = 512 * 1024 * 1024;
     Result result = svcSetHeapSize(&address, size);
     if (R_FAILED(result))
@@ -263,9 +255,10 @@ static int make_directory(const char *path) {
 
 static void setup_directories(void) {
   const char *directories[] = {
-    "/switch", DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, UNZIP_CACHE_DIR,
+    GBASTATION_DIR, DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, UNZIP_CACHE_DIR,
     GAMES_DIR, CHEATS_DIR, SCRIPTS_DIR, SHADERS_DIR, SLOT2_DIR, MICROPHONE_DIR,
-    SAVESTATES_DIR,
+    SAVESTATES_DIR, GBASTATION_DIR "/bios",
+    NDS_BIOS_DIR, GBASTATION_DIR "/cheats",
     BACKUPS_DIR,
   };
   for (unsigned index = 0; index < sizeof(directories) / sizeof(*directories);
@@ -284,17 +277,16 @@ static void validate_inputs(const DrasticRuntimeConfig *config) {
     fatal_error("Missing Drastic core:\n%s", config->core_path);
   if (!regular_file(config->rom_path))
     fatal_error("Nintendo DS ROM not found:\n%s", config->rom_path);
-  if ((!regular_file(SYSTEM_DIR "/nds_bios_arm7.bin") &&
-       !regular_file(SYSTEM_DIR "/drastic_bios_arm7.bin")) ||
-      (!regular_file(SYSTEM_DIR "/nds_bios_arm9.bin") &&
-       !regular_file(SYSTEM_DIR "/drastic_bios_arm9.bin")))
+  if (!regular_file(NDS_BIOS_DIR "/bios7.bin") ||
+      !regular_file(NDS_BIOS_DIR "/bios9.bin"))
     fatal_error("Nintendo DS BIOS files are missing from\n%s.\n\n"
-                "Copy nds_bios_arm7.bin and nds_bios_arm9.bin there.",
-                SYSTEM_DIR);
-  if (!regular_file(SYSTEM_DIR "/nds_firmware_modified.bin") &&
-      !regular_file(SYSTEM_DIR "/nds_firmware.bin"))
+                "Copy bios7.bin and bios9.bin there.", NDS_BIOS_DIR);
+  if (!regular_file(NDS_BIOS_DIR "/firmware.bin"))
     fatal_error("Nintendo DS firmware is missing from\n%s.\n\n"
-                "Copy nds_firmware.bin there.", SYSTEM_DIR);
+                "Copy firmware.bin there.", NDS_BIOS_DIR);
+  if (!regular_file(CHEAT_DATABASE_PATH))
+    fatal_error("DraStic usrcheat.dat is missing from\n%s.",
+                CHEAT_DATABASE_PATH);
   if (!regular_file(SYSTEM_DIR "/game_database.xml"))
     fatal_error("Drastic game_database.xml is missing from\n%s.", SYSTEM_DIR);
 }
@@ -871,12 +863,6 @@ int main(void) {
       runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
           ? OPENSLES_MIC_SOURCE_EXTERNAL
           : OPENSLES_MIC_SOURCE_SIMULATED);
-  char storage_error[256];
-  if (!switchStorageInitializeForPath(DATA_ROOT "/launcher.ini", runtime.rom_path,
-                                      sizeof(runtime.rom_path), storage_error,
-                                      sizeof(storage_error)))
-    fatal_error("Could not mount game storage:\n%s\n\n%s",
-                runtime.rom_path, storage_error);
   validate_inputs(&runtime);
   check_jit_services();
   select_panel_size();
@@ -925,13 +911,9 @@ int main(void) {
   if (!drastic_renderer_init(&runtime)) {
     const char *renderer_error = drastic_renderer_last_error();
     if (renderer_error && renderer_error[0])
-      fatal_error("Could not initialize the %s renderer:\n%s",
-                  DRASTIC_RENDERER == DRASTIC_RENDERER_VK
-                      ? "Vulkan" : "OpenGL",
+      fatal_error("Could not initialize the OpenGL renderer:\n%s",
                   renderer_error);
-    fatal_error("Could not initialize the %s renderer.",
-                DRASTIC_RENDERER == DRASTIC_RENDERER_VK
-                    ? "Vulkan" : "OpenGL");
+    fatal_error("Could not initialize the OpenGL renderer.");
   }
   fatal_error_set_graphics_active(1);
   overlay_init(runtime.rotation);
@@ -1141,11 +1123,6 @@ int main(void) {
   prefs_set_int("Wrapper/StateSlot", controls.state_slot);
   prefs_save();
 
-  /* Match NetherSX2's chainload ordering: schedule the launcher while the
-   * libnx environment is still intact, before core/JIT/runtime teardown. */
-  if (controls.exit_requested && envHasNextLoad() && runtime.launcher_path[0])
-    envSetNextLoad(runtime.launcher_path, runtime.launcher_path);
-
   drastic_input_sampler_destroy(input_sampler);
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
@@ -1162,7 +1139,6 @@ int main(void) {
   pthr_finalize();
   libc_memory_shutdown();
   so_unload(&emu_mod);
-  switchStorageShutdown();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;

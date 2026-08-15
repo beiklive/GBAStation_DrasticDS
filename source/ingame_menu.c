@@ -578,20 +578,13 @@ enum MainMenuItem {
   MAIN_DISPLAY,
   MAIN_EMULATION,
   MAIN_AUDIO_INPUT,
-#ifdef USE_VULKAN
-  MAIN_LSFG,
-#endif
   MAIN_RESET,
   MAIN_QUIT,
   MAIN_ITEM_COUNT,
 };
 
 static int main_item_available(int item) {
-#ifdef USE_VULKAN
-  if (item == MAIN_LSFG) return drastic_renderer_lsfg_available();
-#else
   (void)item;
-#endif
   return 1;
 }
 
@@ -599,11 +592,8 @@ static void render_main(DrasticIngameMenu *menu) {
   static const char *items[] = {
     "Resume game", "Save states", "Cheats", "Screen layout & filters",
     "Emulation options", "Audio, input & motion",
-#ifdef USE_VULKAN
-    "Frame generation",
-#endif
     "Reset game",
-    "Quit to launcher",
+    "Quit emulator",
   };
   draw_shell("Drastic DS", "A  Select     B  Resume");
   const int portrait = ui_is_portrait();
@@ -616,13 +606,6 @@ static void render_main(DrasticIngameMenu *menu) {
   for (int index = 0; index < (int)(sizeof(items) / sizeof(*items)); index++)
   {
     const char *value = NULL;
-#ifdef USE_VULKAN
-    if (index == MAIN_LSFG) {
-      value = drastic_renderer_lsfg_available()
-          ? (drastic_renderer_lsfg_enabled() ? "On" : "Off")
-          : "Disabled";
-    }
-#endif
     draw_row(panel_x + 24, 126 + index * 52, panel_width - 48,
              menu->selection[MENU_MAIN] == index, items[index], value,
              main_item_available(index));
@@ -1147,23 +1130,6 @@ static void update_main(DrasticIngameMenu *menu, u64 pressed) {
     case MAIN_DISPLAY: select_page(menu, MENU_DISPLAY); break;
     case MAIN_EMULATION: select_page(menu, MENU_EMULATION); break;
     case MAIN_AUDIO_INPUT: select_page(menu, MENU_AUDIO_INPUT); break;
-#ifdef USE_VULKAN
-    case MAIN_LSFG: {
-      if (!drastic_renderer_lsfg_available()) {
-        set_status(menu, "Frame generation is disabled for this session");
-        break;
-      }
-      const bool enabled = !drastic_renderer_lsfg_enabled();
-      if (!drastic_renderer_lsfg_request_enabled(enabled)) {
-        set_status(menu, "Frame generation could not be changed");
-        break;
-      }
-      set_status(menu, enabled ?
-          "Frame generation enabled for this session" :
-          "Frame generation disabled for this session");
-      break;
-    }
-#endif
     case MAIN_RESET:
       if (menu->core.reset_ds)
         menu->core.reset_ds(menu->core.env, menu->core.clazz);

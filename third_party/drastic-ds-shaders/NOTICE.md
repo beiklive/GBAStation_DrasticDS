@@ -11,7 +11,5 @@ any later version. See `COPYING` for GPL version 2. Some underlying shader
 algorithms are additionally identified as public domain in their source
 headers.
 
-DrasticDS-nx preserves the original `.dfx` and `.dsd` files for OpenGL and
-generates the adjacent Vulkan SPIR-V packs from the same sources at build
-time. The generated packs are installed with the sources under
-`/switch/drastic/shaders/Bundled/`.
+DrasticDS preserves the original `.dfx` and `.dsd` files for OpenGL. They are
+installed under `sdmc:/GBAStation/drastic/shaders/Bundled/`.

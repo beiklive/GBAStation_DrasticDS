@@ -74,19 +74,14 @@ static void parse_file(const char *path) {
 static void seed_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
   seed("Drastic/RomPath", pending_rom[0] ? pending_rom : DEFAULT_ROM_PATH);
-  seed("Wrapper/Renderer", DRASTIC_RENDERER == DRASTIC_RENDERER_VK ? "vk" : "gl");
   seed("Wrapper/Layout", "horizontal");
   seed("Wrapper/SwapScreens", "false");
   seed("Wrapper/Rotation", "0");
   seed("Wrapper/ScreenGap", "8");
   seed("Wrapper/IntegerScale", "false");
-  seed("Wrapper/VulkanLowLatency", "false");
   seed("Wrapper/TextureFilter", "nearest");
   seed("Wrapper/VideoFilter", "nearest");
   seed("Wrapper/CustomShader", "");
-  seed("Wrapper/LSFGEnabled", "false");
-  seed("Wrapper/LSFGFlowScale", "0.25");
-  seed("Wrapper/LSFGPerformance", "true");
   seed("Wrapper/Volume", "100");
   seed("Wrapper/MicrophoneSource", "noise");
   seed("Wrapper/Vibration", "true");
@@ -231,10 +226,12 @@ void prefs_init(const char *path) {
   snprintf(ini_path, sizeof(ini_path), "%s", path ? path : PREFS_PATH);
   parse_file(ini_path);
   prefs_remove("Wrapper/CpuBoost");
+  prefs_remove("Wrapper/Renderer");
+  prefs_remove("Wrapper/VulkanLowLatency");
+  prefs_remove("Wrapper/LSFGEnabled");
+  prefs_remove("Wrapper/LSFGFlowScale");
+  prefs_remove("Wrapper/LSFGPerformance");
   prefs_remove("Wrapper/LSFGDllPath");
-  const float lsfg_flow = prefs_get_float("Wrapper/LSFGFlowScale", 0.25f);
-  if (prefs_contains("Wrapper/LSFGFlowScale"))
-    put_entry("Wrapper/LSFGFlowScale", lsfg_flow > 0.375f ? "0.5" : "0.25");
   migrate_stylus_mode();
   seed_defaults();
   migrate_hotkey_defaults();
