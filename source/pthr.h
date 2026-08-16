@@ -87,4 +87,19 @@ void pthr_ensure_fake_tls(void);
  * pending notification until waitScreen() consumes it. */
 void pthr_capture_next_cond_wait_as_frame_sync(void);
 
+/* The DraStic screen condition carries several internal notifications for one
+ * display opportunity. Keep one latched wakeup, while exposing the raw count
+ * for diagnostics. */
+typedef struct {
+  uint64_t signaled;
+  uint64_t consumed;
+  uint64_t timed_out;
+  uint64_t pending;
+} PthrFrameSyncStats;
+
+/* Returns whether the wait marked by pthr_capture_next_cond_wait_as_frame_sync
+ * consumed a real screen-ready notification. */
+int pthr_take_frame_sync_ready(void);
+void pthr_get_frame_sync_stats(PthrFrameSyncStats *stats);
+
 #endif

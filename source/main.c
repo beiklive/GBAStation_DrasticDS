@@ -22,6 +22,7 @@
 #include "drastic_renderer.h"
 #include "drastic_rotation.h"
 #include "error.h"
+#include "gamedb.h"
 #include "imports.h"
 #include "ingame_menu.h"
 #include "input_sampler.h"
@@ -301,12 +302,43 @@ static int make_directory(const char *path) {
   return 0;
 }
 
+/* GameDB savePath is a per-game directory and can contain several components
+ * that do not exist yet.  Unlike the fixed host layout, it is supplied at
+ * launch time, so create every missing component before the core can open a
+ * battery save or a savestate below it. */
+static int make_directory_tree(const char *path) {
+  if (!path || !path[0]) return 1;
+  char current[1024];
+  snprintf(current, sizeof(current), "%s", path);
+  for (char *cursor = current; *cursor; cursor++)
+    if (*cursor == '\\') *cursor = '/';
+
+  size_t length = strlen(current);
+  while (length > 1 && current[length - 1] == '/') current[--length] = '\0';
+  char *component = current;
+  if (isalpha((unsigned char)component[0]) && component[1] == ':' &&
+      component[2] == '/')
+    component += 3;
+  else if (*component == '/')
+    component++;
+
+  for (char *slash = component; *slash; slash++) {
+    if (*slash != '/') continue;
+    *slash = '\0';
+    const int made = make_directory(current);
+    *slash = '/';
+    if (!made) return 0;
+  }
+  return make_directory(current);
+}
+
 static void setup_directories(void) {
   const char *directories[] = {
     GBASTATION_DIR, DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, UNZIP_CACHE_DIR,
     GAMES_DIR, CHEATS_DIR, SCRIPTS_DIR, SHADERS_DIR, SLOT2_DIR, MICROPHONE_DIR,
     SAVESTATES_DIR, GBASTATION_DIR "/bios",
-    NDS_BIOS_DIR, GBASTATION_DIR "/cheats",
+    NDS_BIOS_DIR, GBASTATION_DIR "/cheats", GBASTATION_DIR "/screenshots",
+    SCREENSHOTS_DIR,
     BACKUPS_DIR,
   };
   for (unsigned index = 0; index < sizeof(directories) / sizeof(*directories);
@@ -318,6 +350,20 @@ static void setup_directories(void) {
 static int regular_file(const char *path) {
   struct stat status;
   return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+}
+
+static void configured_cheat_database_path(const DrasticRuntimeConfig *config,
+                                           char *path, size_t path_size) {
+  const char *configured = config ? config->cheat_path : "";
+  const char *extension = configured && configured[0]
+      ? strrchr(configured, '.') : NULL;
+  if (configured && configured[0] && extension &&
+      !strcasecmp(extension, ".dat"))
+    snprintf(path, path_size, "%s", configured);
+  else if (configured && configured[0])
+    snprintf(path, path_size, "%s/usrcheat.dat", configured);
+  else
+    snprintf(path, path_size, "%s", CHEAT_DATABASE_PATH);
 }
 
 static void validate_inputs(const DrasticRuntimeConfig *config) {
@@ -332,9 +378,10 @@ static void validate_inputs(const DrasticRuntimeConfig *config) {
   if (!regular_file(NDS_BIOS_DIR "/firmware.bin"))
     fatal_error("Nintendo DS firmware is missing from\n%s.\n\n"
                 "Copy firmware.bin there.", NDS_BIOS_DIR);
-  if (!regular_file(CHEAT_DATABASE_PATH))
-    fatal_error("DraStic usrcheat.dat is missing from\n%s.",
-                CHEAT_DATABASE_PATH);
+  char cheat_database[1024];
+  configured_cheat_database_path(config, cheat_database, sizeof(cheat_database));
+  if (!regular_file(cheat_database))
+    fatal_error("DraStic usrcheat.dat is missing from\n%s.", cheat_database);
   if (!regular_file(SYSTEM_DIR "/game_database.xml"))
     fatal_error("Drastic game_database.xml is missing from\n%s.", SYSTEM_DIR);
 }
@@ -666,6 +713,7 @@ typedef struct {
   u64 previous_slot;
   u64 reset;
   u64 quit;
+  u64 screenshot;
 } RuntimeHotkeys;
 
 typedef struct {
@@ -690,6 +738,20 @@ typedef struct {
   float fps;
 } RuntimeHud;
 
+typedef struct {
+  u64 window_start;
+  PthrFrameSyncStats baseline;
+  unsigned captures;
+  unsigned changed_captures;
+  unsigned last_presents;
+  unsigned window_presents;
+  u64 last_present_tick;
+  u64 present_gap_total;
+  u64 present_gap_min;
+  u64 present_gap_max;
+  unsigned present_gap_count;
+} RuntimeFrameSyncMonitor;
+
 static void remove_duplicate_hotkeys(RuntimeHotkeys *hotkeys) {
   u64 *ordered[] = {
     &hotkeys->menu,
@@ -705,6 +767,7 @@ static void remove_duplicate_hotkeys(RuntimeHotkeys *hotkeys) {
     &hotkeys->previous_slot,
     &hotkeys->reset,
     &hotkeys->quit,
+    &hotkeys->screenshot,
   };
   for (unsigned index = 0;
        index < sizeof(ordered) / sizeof(*ordered); index++) {
@@ -747,6 +810,73 @@ static void update_runtime_hud(RuntimeHud *hud,
   overlay_draw_hud(config->show_fps, hud->fps, controls->fast_forward);
 }
 
+static void update_frame_sync_monitor(RuntimeFrameSyncMonitor *monitor,
+                                      int frame_ready,
+                                      int fast_forward) {
+  PthrFrameSyncStats current;
+  pthr_get_frame_sync_stats(&current);
+  const u64 now = armGetSystemTick();
+  const u64 frequency = armGetSystemTickFreq();
+  if (!monitor->window_start) {
+    monitor->window_start = now;
+    monitor->baseline = current;
+    monitor->captures = drastic_renderer_capture_count();
+    monitor->changed_captures = drastic_renderer_changed_capture_count();
+    monitor->last_presents = drastic_renderer_frame_count();
+    return;
+  }
+
+  const unsigned captures = drastic_renderer_capture_count();
+  const unsigned changed_captures = drastic_renderer_changed_capture_count();
+  const unsigned presents = drastic_renderer_frame_count();
+  if (presents != monitor->last_presents) {
+    monitor->window_presents += presents - monitor->last_presents;
+    monitor->last_presents = presents;
+    if (monitor->last_present_tick) {
+      const u64 gap = now - monitor->last_present_tick;
+      monitor->present_gap_total += gap;
+      if (!monitor->present_gap_min || gap < monitor->present_gap_min)
+        monitor->present_gap_min = gap;
+      if (gap > monitor->present_gap_max) monitor->present_gap_max = gap;
+      monitor->present_gap_count++;
+    }
+    monitor->last_present_tick = now;
+  }
+  if (!frequency || now - monitor->window_start < frequency) return;
+
+  const u64 average_gap_us = monitor->present_gap_count
+      ? (monitor->present_gap_total * UINT64_C(1000000)) /
+            (frequency * monitor->present_gap_count)
+      : 0;
+  const u64 minimum_gap_us = monitor->present_gap_min
+      ? (monitor->present_gap_min * UINT64_C(1000000)) / frequency : 0;
+  const u64 maximum_gap_us = monitor->present_gap_max
+      ? (monitor->present_gap_max * UINT64_C(1000000)) / frequency : 0;
+  debug_logf("frame-sync ready=%d ff=%d signal=%llu consumed=%llu timeout=%llu pending=%llu capture=%u changed=%u present=%u",
+             frame_ready, fast_forward,
+             (unsigned long long)(current.signaled - monitor->baseline.signaled),
+             (unsigned long long)(current.consumed - monitor->baseline.consumed),
+             (unsigned long long)(current.timed_out - monitor->baseline.timed_out),
+             (unsigned long long)current.pending,
+             captures - monitor->captures,
+             changed_captures - monitor->changed_captures,
+             monitor->window_presents);
+  debug_logf("frame-sync present-gap-us avg=%llu min=%llu max=%llu samples=%u",
+             (unsigned long long)average_gap_us,
+             (unsigned long long)minimum_gap_us,
+             (unsigned long long)maximum_gap_us,
+             monitor->present_gap_count);
+  monitor->window_start = now;
+  monitor->baseline = current;
+  monitor->captures = captures;
+  monitor->changed_captures = changed_captures;
+  monitor->window_presents = 0;
+  monitor->present_gap_total = 0;
+  monitor->present_gap_min = 0;
+  monitor->present_gap_max = 0;
+  monitor->present_gap_count = 0;
+}
+
 static void load_runtime_controls(RuntimeControls *controls) {
   controls->hotkeys.menu = launcher_mapping_combo("nds.hotkey.menu.pad");
   controls->hotkeys.fast_forward = launcher_mapping_combo("nds.handle.fastforward");
@@ -761,6 +891,7 @@ static void load_runtime_controls(RuntimeControls *controls) {
   controls->hotkeys.previous_slot = launcher_mapping_combo("nds.hotkey.previous_slot.pad");
   controls->hotkeys.reset = launcher_mapping_combo("nds.hotkey.reset.pad");
   controls->hotkeys.quit = launcher_mapping_combo("nds.hotkey.quit.pad");
+  controls->hotkeys.screenshot = launcher_mapping_combo("nds.hotkey.screenshot.pad");
   /* A saved duplicate must never execute two emulator actions. The menu is
    * reserved first, then fast-forward, followed by the remaining hotkeys. */
   remove_duplicate_hotkeys(&controls->hotkeys);
@@ -831,6 +962,7 @@ static void configure_input_sampler(DrasticInputSamplerConfig *config,
       controls->hotkeys.previous_slot;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_RESET] = controls->hotkeys.reset;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_QUIT] = controls->hotkeys.quit;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_SCREENSHOT] = controls->hotkeys.screenshot;
   config->analog_touch_button = controls->analog_touch_button;
   config->stylus_speed = controls->stylus_speed;
   config->panel_width = panel_width;
@@ -880,6 +1012,16 @@ static int process_input(DrasticRuntimeConfig *config,
   }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_QUIT))
     controls->exit_requested = 1;
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_SCREENSHOT)) {
+    char screenshot_path[1200];
+    snprintf(screenshot_path, sizeof(screenshot_path),
+             "%s/screenshot_%llu.png",
+             config->save_path[0] ? config->save_path : SCREENSHOTS_DIR,
+             (unsigned long long)armGetSystemTick());
+    debug_logf("screenshot %s path=%s",
+               drastic_renderer_write_screenshot(screenshot_path) ? "saved" : "failed",
+               screenshot_path);
+  }
 
   if (controls->fast_forward_toggle &&
       (pressed & DRASTIC_INPUT_HOTKEY_BIT(
@@ -893,11 +1035,6 @@ static int process_input(DrasticRuntimeConfig *config,
     uint64_t packed = config->core_config;
     if (fast_forward) packed |= UINT64_C(1) << 29;
     core.applyConfig(fake_env, clazz, (jlong)packed);
-  }
-  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
-                    DRASTIC_INPUT_HOTKEY_SWAP_SCREENS)) {
-    config->swap_screens ^= 1;
-    drastic_config_calculate_layout(config, panel_width, panel_height);
   }
   const int microphone_feed =
       config->microphone_enabled &&
@@ -1036,6 +1173,17 @@ int main(int argc, char *argv[]) {
   setup_directories();
   debug_logf("stage=directories-ready");
   prefs_init(PREFS_PATH);
+  char game_save_path[1024];
+  if (gamedb_get_save_path(launch.rom_path, game_save_path,
+                           sizeof(game_save_path))) {
+    /* GameDB is the source of truth for this game's battery saves, states and
+     * state thumbnails.  Do not rely solely on a one-shot launcher profile. */
+    prefs_set_string("Wrapper/SavePath", game_save_path);
+    debug_logf("save_path source=GameDB path=%s", game_save_path);
+  } else {
+    debug_logf("save_path source=launch-profile path=%s",
+               prefs_get_string("Wrapper/SavePath", "(default)"));
+  }
   debug_logf("stage=prefs-ready rom=%s", prefs_get_string("Drastic/RomPath", ""));
   /* Drastic builds mirrored ARM7/ARM9 address-space views from Android ashmem.
    * The Switch shim provides those aliases and the lazy 4 GiB fastmem window. */
@@ -1044,8 +1192,12 @@ int main(int argc, char *argv[]) {
 
   DrasticRuntimeConfig runtime;
   drastic_config_load(&runtime);
-  debug_logf("stage=config-loaded rom=%s core=%s", runtime.rom_path,
-             runtime.core_path);
+  if (!make_directory_tree(runtime.save_path))
+    fatal_error("Could not create the game save directory:\n%s",
+                runtime.save_path);
+  debug_logf("stage=config-loaded rom=%s core=%s save_path=%s raw_sav=1",
+             runtime.rom_path, runtime.core_path,
+             runtime.save_path[0] ? runtime.save_path : "(default)");
   opensles_set_microphone_enabled(runtime.microphone_enabled != 0);
   opensles_set_microphone_source(
       runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
@@ -1112,6 +1264,8 @@ int main(int argc, char *argv[]) {
   debug_logf("stage=renderer-ready");
   fatal_error_set_graphics_active(1);
   overlay_init(runtime.rotation);
+  if (!overlay_set_png_mask(runtime.overlay_path, runtime.overlay_enabled != 0))
+    debug_logf("overlay PNG load failed path=%s", runtime.overlay_path);
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
 
   char prepared_rom_path[sizeof(runtime.rom_path)];
@@ -1200,6 +1354,11 @@ int main(int argc, char *argv[]) {
     fatal_error("Could not create the Drastic emulation thread (%d).",
                 game_thread_result);
   debug_logf("stage=emulation-thread-started");
+  int game_play_count = 0;
+  int game_play_time = 0;
+  (void)gamedb_session_started(runtime.rom_path, &game_play_count,
+                               &game_play_time);
+  const u64 game_session_started = armGetSystemTick();
 
   DrasticInputSamplerConfig input_config;
   configure_input_sampler(&input_config, &controls, clazz);
@@ -1230,6 +1389,7 @@ int main(int argc, char *argv[]) {
   unsigned boot_frames = 0;
   int persisted_cheats_applied = 0;
   RuntimeHud hud = {0};
+  RuntimeFrameSyncMonitor frame_sync_monitor = {0};
   while (!controls.exit_requested &&
          !__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
     if (!appletMainLoop()) break;
@@ -1290,13 +1450,22 @@ int main(int argc, char *argv[]) {
      * gameplay input independently while this render loop is blocked. */
     const int open_menu = process_input(
         &runtime, &controls, clazz, menu, input_sampler);
+    if (controls.exit_requested) break;
+    const bool presentation_acquired = drastic_renderer_acquire_next_frame();
     pthr_capture_next_cond_wait_as_frame_sync();
     core.waitScreen(fake_env, clazz);
-    if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE))
+    if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
+      if (presentation_acquired)
+        drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
+                                 overlay_frame(), false);
       break;
-    update_runtime_hud(&hud, &runtime, &controls, 1);
+    }
+    const int core_frame_ready = pthr_take_frame_sync_ready();
+    update_runtime_hud(&hud, &runtime, &controls, core_frame_ready);
     drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
-                             overlay_frame(), true);
+                             overlay_frame(), core_frame_ready);
+    update_frame_sync_monitor(&frame_sync_monitor, core_frame_ready,
+                              controls.fast_forward);
     if (cpu_boost_active) {
       cpu_boost(0);
       cpu_boost_active = false;
@@ -1325,6 +1494,14 @@ int main(int argc, char *argv[]) {
     fatal_error("Drastic could not start:\n%s", runtime.rom_path);
   prefs_set_int("Wrapper/StateSlot", controls.state_slot);
   prefs_save();
+
+  const u64 session_frequency = armGetSystemTickFreq();
+  const u64 session_ticks = armGetSystemTick() - game_session_started;
+  if (session_frequency)
+    game_play_time += (int)(session_ticks / session_frequency);
+  (void)gamedb_session_finished(runtime.rom_path, game_play_count,
+                                game_play_time,
+                                runtime.save_path[0] ? runtime.save_path : SCREENSHOTS_DIR);
 
   drastic_input_sampler_destroy(input_sampler);
   HidVibrationValue stopped[2] = {0};

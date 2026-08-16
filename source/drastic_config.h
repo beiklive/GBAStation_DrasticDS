@@ -79,6 +79,19 @@ typedef struct {
   int screen_count;
   uint32_t firmware_userdata;
   uint64_t core_config;
+  /* NDS custom-layout convention shared with nds_stub and GameDB: each
+   * screen is its native 256x192 image multiplied by scale, then moved by
+   * an offset in logical canvas pixels. */
+  float custom_top_scale;
+  float custom_top_offset_x;
+  float custom_top_offset_y;
+  float custom_bottom_scale;
+  float custom_bottom_offset_x;
+  float custom_bottom_offset_y;
+  int overlay_enabled;
+  char overlay_path[1024];
+  char save_path[1024];
+  char cheat_path[1024];
   DrasticScreenRect screens[3];
   /* Normalized custom rectangles. Index 0 is the DS top screen. */
   DrasticScreenRect custom_screens[2];

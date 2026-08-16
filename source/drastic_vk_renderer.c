@@ -10,7 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <png.h>
+
 #include "config.h"
+#include "debug_log.h"
 #include "dfx_fxaa_frag_bin.h"
 #include "dfx_fxaa_hq_frag_bin.h"
 #include "dfx_fxaa_hq_vert_bin.h"
@@ -152,6 +155,9 @@ static uint32_t g_image_count;
 static RenderFrameSlot g_frame_slots[RENDER_FRAME_SLOTS];
 static uint32_t g_frame_slot_count = 1;
 static uint32_t g_frame_slot_cursor;
+static int g_preacquired_frame;
+static uint32_t g_preacquired_slot;
+static uint32_t g_preacquired_image;
 static VkCommandPool g_command_pool;
 static VkRenderPass g_render_pass;
 static VkRenderPass g_filter_render_pass;
@@ -178,6 +184,10 @@ static uint32_t g_draw_count;
 static uint32_t g_vertex_count;
 static uint64_t g_overlay_generation = UINT64_MAX;
 static unsigned g_frames;
+static unsigned g_captures;
+static unsigned g_changed_captures;
+static uint64_t g_last_capture_hash;
+static int g_last_capture_hash_valid;
 static uint32_t g_ds_width = 256;
 static uint32_t g_ds_height = 192;
 static uint32_t *g_core_pixels;
@@ -290,6 +300,17 @@ static void lsfg_destroy_runtime(void) {
   if (!g_lsfg_runtime) return;
   lsfg_nx_destroy(g_lsfg_runtime);
   g_lsfg_runtime = NULL;
+}
+
+/* A broken optional frame-generation pass must never suppress the ordinary
+ * Vulkan present. Persist the disabled state as well, so the next launch is
+ * recoverable even when the user cannot see the menu through a black frame. */
+static void lsfg_disable_after_failure(const char *phase, VkResult result) {
+  debug_logf("lsfg failure phase=%s result=%d; falling back to native present",
+             phase ? phase : "unknown", result);
+  __atomic_store_n(&g_lsfg_enabled_requested, 0, __ATOMIC_RELEASE);
+  prefs_set_bool("Wrapper/LSFGEnabled", false);
+  prefs_save_runtime_key("Wrapper/LSFGEnabled");
 }
 
 static VkDeviceSize align_device_size(VkDeviceSize value,
@@ -408,23 +429,44 @@ static int choose_surface_format(void) {
   if (!vk_ok(vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface,
                                                    &count, formats)))
     return 0;
+  /* The core and ImGui-style overlay data are authored in display (sRGB)
+   * space. Rendering those values directly to an sRGB attachment makes the
+   * driver encode them a second time, which washes out both the game and the
+   * menu. Prefer an UNORM surface whenever VI advertises one; retain sRGB as
+   * a compatibility fallback for surfaces that expose no UNORM format. */
   g_format = VK_FORMAT_UNDEFINED;
   g_color_space = formats[0].colorSpace;
-  VkFormat rgba_fallback = VK_FORMAT_UNDEFINED;
+  VkSurfaceFormatKHR bgra_srgb = {VK_FORMAT_UNDEFINED, 0};
+  VkSurfaceFormatKHR rgba_unorm = {VK_FORMAT_UNDEFINED, 0};
+  VkSurfaceFormatKHR rgba_srgb = {VK_FORMAT_UNDEFINED, 0};
   for (uint32_t index = 0; index < count; index++) {
-    if (formats[index].format == VK_FORMAT_B8G8R8A8_UNORM ||
-        formats[index].format == VK_FORMAT_B8G8R8A8_SRGB) {
+    if (formats[index].format == VK_FORMAT_B8G8R8A8_UNORM) {
       g_format = formats[index].format;
       g_color_space = formats[index].colorSpace;
       break;
     }
-    if (formats[index].format == VK_FORMAT_R8G8B8A8_UNORM ||
-        formats[index].format == VK_FORMAT_R8G8B8A8_SRGB) {
-      rgba_fallback = formats[index].format;
-      g_color_space = formats[index].colorSpace;
-    }
+    if (formats[index].format == VK_FORMAT_R8G8B8A8_UNORM)
+      rgba_unorm = formats[index];
+    else if (formats[index].format == VK_FORMAT_B8G8R8A8_SRGB)
+      bgra_srgb = formats[index];
+    else if (formats[index].format == VK_FORMAT_R8G8B8A8_SRGB)
+      rgba_srgb = formats[index];
   }
-  if (g_format == VK_FORMAT_UNDEFINED) g_format = rgba_fallback;
+  if (g_format == VK_FORMAT_UNDEFINED &&
+      rgba_unorm.format != VK_FORMAT_UNDEFINED) {
+    g_format = rgba_unorm.format;
+    g_color_space = rgba_unorm.colorSpace;
+  }
+  if (g_format == VK_FORMAT_UNDEFINED &&
+      bgra_srgb.format != VK_FORMAT_UNDEFINED) {
+    g_format = bgra_srgb.format;
+    g_color_space = bgra_srgb.colorSpace;
+  }
+  if (g_format == VK_FORMAT_UNDEFINED &&
+      rgba_srgb.format != VK_FORMAT_UNDEFINED) {
+    g_format = rgba_srgb.format;
+    g_color_space = rgba_srgb.colorSpace;
+  }
   if (g_format == VK_FORMAT_UNDEFINED && count == 1 &&
       formats[0].format == VK_FORMAT_UNDEFINED)
     g_format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -2250,6 +2292,7 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   g_lsfg_pipeline_prepared = lsfg_launch_enabled;
   g_frame_slot_count = lsfg_launch_enabled ? RENDER_FRAME_SLOTS : 1;
   g_frame_slot_cursor = 0;
+  g_preacquired_frame = 0;
   memset(g_frame_slots, 0, sizeof(g_frame_slots));
   /* LSFG owns presentation pacing and needs its larger swapchain. Keep the
    * native low-latency path mutually exclusive for the lifetime of this
@@ -2353,6 +2396,12 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
                              &slot->fence)))
       return false;
   }
+  /* The LSFG swapchain and timeline-semaphore resources must have been
+   * selected before device creation.  Once that succeeded, honour the saved
+   * preference so frame generation starts with the game instead of requiring
+   * an otherwise unreachable runtime request. */
+  if (lsfg_launch_enabled)
+    (void)drastic_renderer_lsfg_request_enabled(true);
   return true;
 }
 
@@ -2360,6 +2409,15 @@ static void stage_screen_pixels(uint8_t *destination,
                                 const uint32_t *source) {
   const size_t pixels = (size_t)g_ds_width * g_ds_height;
   memcpy(destination, source, pixels * sizeof(uint32_t));
+}
+
+static uint64_t capture_hash(const uint32_t *pixels, size_t count) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (size_t index = 0; index < count; index++) {
+    hash ^= pixels[index];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
 }
 
 static void capture_core_frame(DrasticCoreRenderFrame core_render,
@@ -2371,6 +2429,12 @@ static void capture_core_frame(DrasticCoreRenderFrame core_render,
   core_render(env, clazz, (int)DRASTIC_VK_CAPTURE_TOP_TEXTURE,
               (int)DRASTIC_VK_CAPTURE_BOTTOM_TEXTURE, 0);
   drastic_vk_capture_end();
+  const uint64_t hash = capture_hash(g_core_pixels, pixels * 2);
+  if (g_last_capture_hash_valid && hash != g_last_capture_hash)
+    g_changed_captures++;
+  g_last_capture_hash = hash;
+  g_last_capture_hash_valid = 1;
+  g_captures++;
   *consumed = 1;
 }
 
@@ -2407,6 +2471,23 @@ static int wait_frame_slot(uint32_t slot_index) {
   return 1;
 }
 
+bool drastic_renderer_acquire_next_frame(void) {
+  if (!g_device || !g_swapchain) return false;
+  if (g_preacquired_frame) return true;
+  const uint32_t slot_index = g_frame_slot_cursor;
+  RenderFrameSlot *frame = &g_frame_slots[slot_index];
+  if (!wait_frame_slot(slot_index)) return false;
+  uint32_t image_index = 0;
+  const VkResult acquired = vkAcquireNextImageKHR(
+      g_device, g_swapchain, UINT64_C(50000000), frame->acquired,
+      VK_NULL_HANDLE, &image_index);
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return false;
+  g_preacquired_frame = 1;
+  g_preacquired_slot = slot_index;
+  g_preacquired_image = image_index;
+  return true;
+}
+
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
@@ -2435,9 +2516,26 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
 
   const uint32_t slot_index = g_frame_slot_cursor;
   RenderFrameSlot *frame = &g_frame_slots[slot_index];
-  if (!wait_frame_slot(slot_index)) {
-    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
-    return;
+  uint32_t image_index = 0;
+  if (g_preacquired_frame && g_preacquired_slot == slot_index) {
+    image_index = g_preacquired_image;
+    g_preacquired_frame = 0;
+  } else {
+    if (!wait_frame_slot(slot_index)) {
+      capture_core_frame(core_render, env, clazz, &core_frame_consumed);
+      return;
+    }
+    const VkResult acquired = vkAcquireNextImageKHR(
+        g_device, g_swapchain, UINT64_C(50000000), frame->acquired,
+        VK_NULL_HANDLE, &image_index);
+    if (acquired == VK_TIMEOUT) {
+      capture_core_frame(core_render, env, clazz, &core_frame_consumed);
+      return;
+    }
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+      capture_core_frame(core_render, env, clazz, &core_frame_consumed);
+      return;
+    }
   }
   g_staging_base = (VkDeviceSize)slot_index * g_staging_stride;
   VkResult result;
@@ -2447,20 +2545,6 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
   if (upload_screens) g_filter_valid[0] = g_filter_valid[1] = 0;
-
-  uint32_t image_index = 0;
-  const VkResult acquired = vkAcquireNextImageKHR(
-      g_device, g_swapchain, UINT64_C(50000000), frame->acquired,
-      VK_NULL_HANDLE,
-      &image_index);
-  if (acquired == VK_TIMEOUT) {
-    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
-    return;
-  }
-  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
-    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
-    return;
-  }
 
   if (defer_core_capture)
     capture_core_frame(core_render, env, clazz, &core_frame_consumed);
@@ -2533,14 +2617,27 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   };
   const int requested = lsfg_requested();
   if (requested) {
-    if (!g_lsfg_swapchain_compatible || !lsfg_try_create()) return;
+    int lsfg_presented = 0;
+    if (!g_lsfg_swapchain_compatible || !lsfg_try_create()) {
+      lsfg_disable_after_failure("initialization", VK_ERROR_INITIALIZATION_FAILED);
+    } else {
     VkResult present_result = VK_ERROR_INITIALIZATION_FAILED;
-    if (!lsfg_nx_present(g_lsfg_runtime, g_queue, &present,
-                         &present_result))
-      return;
-    if (present_result != VK_SUCCESS &&
-        present_result != VK_SUBOPTIMAL_KHR)
-      return;
+      if (!lsfg_nx_present(g_lsfg_runtime, g_queue, &present,
+                           &present_result)) {
+        lsfg_disable_after_failure("present-call", present_result);
+      } else if (present_result != VK_SUCCESS &&
+                 present_result != VK_SUBOPTIMAL_KHR) {
+        lsfg_disable_after_failure("present-result", present_result);
+      } else {
+        lsfg_presented = 1;
+      }
+    }
+    if (!lsfg_presented) {
+      const VkResult present_result = vkQueuePresentKHR(g_queue, &present);
+      if (present_result != VK_SUCCESS &&
+          present_result != VK_SUBOPTIMAL_KHR)
+        return;
+    }
   } else {
     const VkResult present_result = vkQueuePresentKHR(g_queue, &present);
     if (present_result != VK_SUCCESS &&
@@ -2641,6 +2738,7 @@ void drastic_renderer_shutdown(void) {
   memset(g_frame_slots, 0, sizeof(g_frame_slots));
   g_frame_slot_count = 1;
   g_frame_slot_cursor = 0;
+  g_preacquired_frame = 0;
   g_staging_mapped = NULL;
   g_staging_size = 0;
   g_staging_stride = 0;
@@ -2648,6 +2746,42 @@ void drastic_renderer_shutdown(void) {
 }
 
 unsigned drastic_renderer_frame_count(void) { return g_frames; }
+unsigned drastic_renderer_capture_count(void) { return g_captures; }
+unsigned drastic_renderer_changed_capture_count(void) { return g_changed_captures; }
+
+bool drastic_renderer_write_screenshot(const char *path) {
+  if (!path || !path[0] || !g_core_pixels || !g_ds_width || !g_ds_height)
+    return false;
+  const unsigned width = g_ds_width;
+  const unsigned height = g_ds_height * 2;
+  const size_t bytes = (size_t)width * height * 4;
+  uint8_t *rgba = malloc(bytes);
+  if (!rgba) return false;
+  const size_t screen_pixels = (size_t)g_ds_width * g_ds_height;
+  for (unsigned screen = 0; screen < 2; screen++) {
+    const uint32_t *source = g_core_pixels + screen * screen_pixels;
+    for (unsigned y = 0; y < g_ds_height; y++) {
+      uint8_t *destination = rgba +
+          ((size_t)(screen * g_ds_height + y) * width) * 4;
+      for (unsigned x = 0; x < g_ds_width; x++) {
+        const uint32_t pixel = source[(size_t)y * g_ds_width + x];
+        destination[x * 4 + 0] = (uint8_t)(pixel >> 16);
+        destination[x * 4 + 1] = (uint8_t)(pixel >> 8);
+        destination[x * 4 + 2] = (uint8_t)pixel;
+        destination[x * 4 + 3] = 255;
+      }
+    }
+  }
+  png_image image;
+  memset(&image, 0, sizeof(image));
+  image.version = PNG_IMAGE_VERSION;
+  image.width = width;
+  image.height = height;
+  image.format = PNG_FORMAT_RGBA;
+  const int written = png_image_write_to_file(&image, path, 0, rgba, 0, NULL);
+  free(rgba);
+  return written != 0;
+}
 
 bool drastic_renderer_lsfg_available(void) {
   return __atomic_load_n(&g_lsfg_runtime_available, __ATOMIC_ACQUIRE) != 0;
@@ -2660,6 +2794,10 @@ bool drastic_renderer_lsfg_request_enabled(bool enabled) {
   __atomic_store_n(&g_lsfg_enabled_requested, enabled != 0,
                    __ATOMIC_RELEASE);
   return true;
+}
+
+bool drastic_renderer_lsfg_dll_available(void) {
+  return file_readable(lsfg_dll_path()) != 0;
 }
 
 #endif

@@ -22,6 +22,7 @@
 #define BACKUPS_DIR     USER_DIR "/backup"
 #define GBASTATION_DIR  "sdmc:/GBAStation"
 #define NDS_BIOS_DIR    GBASTATION_DIR "/bios/NDS"
+#define SCREENSHOTS_DIR GBASTATION_DIR "/screenshots/NDS"
 #define CHEAT_DATABASE_PATH GBASTATION_DIR "/cheats/usrcheat.dat"
 #define PREFS_NAME      "drastic.ini"
 #define PREFS_PATH      DATA_ROOT "/" PREFS_NAME

@@ -19,8 +19,12 @@
 static __thread int tls_is_render_thread = 0;
 static __thread int tls_capture_frame_sync = 0;
 static __thread int tls_is_core_thread = 0;
+static __thread int tls_frame_sync_ready = 0;
 static pthread_cond_t_bionic *frame_sync_cond;
-static unsigned frame_sync_pending;
+static uint64_t frame_sync_pending;
+static uint64_t frame_sync_signaled;
+static uint64_t frame_sync_consumed;
+static uint64_t frame_sync_timed_out;
 static int core_shutdown_requested;
 
 int pthr_is_render_thread(void) {
@@ -29,6 +33,21 @@ int pthr_is_render_thread(void) {
 
 void pthr_capture_next_cond_wait_as_frame_sync(void) {
   tls_capture_frame_sync = 1;
+  tls_frame_sync_ready = 0;
+}
+
+int pthr_take_frame_sync_ready(void) {
+  const int ready = tls_frame_sync_ready;
+  tls_frame_sync_ready = 0;
+  return ready;
+}
+
+void pthr_get_frame_sync_stats(PthrFrameSyncStats *stats) {
+  if (!stats) return;
+  stats->signaled = __atomic_load_n(&frame_sync_signaled, __ATOMIC_ACQUIRE);
+  stats->consumed = __atomic_load_n(&frame_sync_consumed, __ATOMIC_ACQUIRE);
+  stats->timed_out = __atomic_load_n(&frame_sync_timed_out, __ATOMIC_ACQUIRE);
+  stats->pending = __atomic_load_n(&frame_sync_pending, __ATOMIC_ACQUIRE);
 }
 
 static int frame_sync_match(pthread_cond_t_bionic *cond) {
@@ -41,6 +60,19 @@ static void frame_sync_capture(pthread_cond_t_bionic *cond) {
   pthread_cond_t_bionic *expected = NULL;
   __atomic_compare_exchange_n(&frame_sync_cond, &expected, cond, false,
                               __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+static void frame_sync_note_signal(void) {
+  __atomic_fetch_add(&frame_sync_signaled, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&frame_sync_pending, 1, __ATOMIC_RELEASE);
+}
+
+static int frame_sync_take_pending(void) {
+  if (!__atomic_exchange_n(&frame_sync_pending, 0, __ATOMIC_ACQ_REL))
+    return 0;
+  __atomic_fetch_add(&frame_sync_consumed, 1, __ATOMIC_RELAXED);
+  tls_frame_sync_ready = 1;
+  return 1;
 }
 
 #define BIONIC_PTHREAD_MUTEX_INITIALIZER            0
@@ -685,6 +717,9 @@ int pthread_cond_destroy_soloader(pthread_cond_t_bionic *cond) {
   __atomic_store_n(&cond->magic, 0, __ATOMIC_RELEASE);
   if (frame_sync_match(cond)) {
     __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&frame_sync_signaled, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&frame_sync_consumed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&frame_sync_timed_out, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&frame_sync_cond, NULL, __ATOMIC_RELEASE);
   }
   pthread_cond_t *real = cond->real_ptr;
@@ -709,7 +744,7 @@ int pthread_cond_signal_soloader(pthread_cond_t_bionic *cond) {
   if (!cond) return EINVAL;
   cond_static_init(cond, NULL);
   if (frame_sync_match(cond))
-    __atomic_store_n(&frame_sync_pending, 1, __ATOMIC_RELEASE);
+    frame_sync_note_signal();
   return pthread_cond_signal(cond->real_ptr);
 }
 
@@ -717,7 +752,7 @@ int pthread_cond_broadcast_soloader(pthread_cond_t_bionic *cond) {
   if (!cond) return EINVAL;
   cond_static_init(cond, NULL);
   if (frame_sync_match(cond))
-    __atomic_store_n(&frame_sync_pending, 1, __ATOMIC_RELEASE);
+    frame_sync_note_signal();
   return pthread_cond_broadcast(cond->real_ptr);
 }
 
@@ -759,8 +794,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
   frame_sync_capture(cond);
   const int is_frame_sync = frame_sync_match(cond);
   core_thread_exit_from_wait(mutex->real_ptr);
-  if (is_frame_sync &&
-      __atomic_exchange_n(&frame_sync_pending, 0, __ATOMIC_ACQ_REL))
+  if (is_frame_sync && frame_sync_take_pending())
     return 0;
   // about to park: hand back the GL context so other threads can render
   extern void egl_gl_ownership_park(void);
@@ -779,7 +813,9 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
                                               mutex->real_ptr, &deadline);
     core_thread_exit_from_wait(mutex->real_ptr);
     if (result == 0)
-      __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
+      (void)frame_sync_take_pending();
+    else if (result == ETIMEDOUT)
+      __atomic_fetch_add(&frame_sync_timed_out, 1, __ATOMIC_RELAXED);
     return result == ETIMEDOUT ? 0 : result;
   }
   extern int egl_gl_thread_holds_context(void);
@@ -787,7 +823,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     const int result = pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
     core_thread_exit_from_wait(mutex->real_ptr);
     if (is_frame_sync && result == 0)
-      __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
+      (void)frame_sync_take_pending();
     return result;
   }
   // render thread still holding the GL binding: wait ONE short slice and
@@ -801,7 +837,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
   int r = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, &ts);
   core_thread_exit_from_wait(mutex->real_ptr);
   if (is_frame_sync && r == 0)
-    __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
+    (void)frame_sync_take_pending();
   if (r == ETIMEDOUT) {
     return 0; // spurious wakeup (POSIX/bionic allow them)
   }

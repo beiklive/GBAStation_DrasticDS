@@ -53,7 +53,7 @@ uint64_t drastic_config_build_core_config(void) {
   const int frameskip = clamp_int(prefs_get_int("Drastic/FrameskipValue", 0), 0, 9);
   const int frameskip_type = clamp_int(prefs_get_int("Drastic/FrameskipType", 0), 0, 3);
   const int audio_latency = clamp_int(prefs_get_int("Drastic/AudioLatency", 2), 0, 3);
-  const int fast_forward = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 2), 0, 5);
+  const int fast_forward = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 5), 0, 5);
   const int cpu_threads = clamp_int(prefs_get_int("Drastic/CpuThreads", 3), 1, 3);
   const int autofire = clamp_int(prefs_get_int("Drastic/AutoFireSpeed", 2), 0, 7);
   const int mic_level = clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3);
@@ -107,7 +107,9 @@ static DrasticVideoFilter read_filter(void) {
       prefs_get_string("Wrapper/TextureFilter", "nearest"));
   if (!strcmp(filter, "linear")) return DRASTIC_FILTER_LINEAR;
   if (!strcmp(filter, "quilez")) return DRASTIC_FILTER_QUILEZ;
-  if (!strcmp(filter, "scanline")) return DRASTIC_FILTER_SCANLINE;
+  /* The scanline pipeline is unstable in the Vulkan host; old saved values
+   * are safely migrated to nearest-neighbour instead of reaching it. */
+  if (!strcmp(filter, "scanline")) return DRASTIC_FILTER_NEAREST;
   if (!strcmp(filter, "scale2x")) return DRASTIC_FILTER_SCALE2X;
   if (!strcmp(filter, "hq2x")) return DRASTIC_FILTER_HQ2X;
   if (!strcmp(filter, "fxaa")) return DRASTIC_FILTER_FXAA;
@@ -145,6 +147,35 @@ static float clamp_float(float value, float minimum, float maximum) {
   return value;
 }
 
+static void set_custom_canvas_rect(DrasticRuntimeConfig *config, int screen,
+                                   int width, int height) {
+  const int portrait = config->rotation & 1;
+  const float canvas_width = portrait ? 720.0f : 1280.0f;
+  const float canvas_height = portrait ? 1280.0f : 720.0f;
+  const float base_x = portrait ? (canvas_width - 256.0f) * 0.5f
+                                : (screen ? 800.0f : 224.0f);
+  const float base_y = portrait ? (canvas_height * 0.5f +
+                                    (screen ? 0.0f : -192.0f))
+                                : 264.0f;
+  const float scale = screen ? config->custom_bottom_scale
+                             : config->custom_top_scale;
+  const float offset_x = screen ? config->custom_bottom_offset_x
+                                : config->custom_top_offset_x;
+  const float offset_y = screen ? config->custom_bottom_offset_y
+                                : config->custom_top_offset_y;
+  const float dst_width = fmaxf(4.0f, roundf(256.0f * scale / 4.0f) * 4.0f);
+  const float dst_height = fmaxf(3.0f, dst_width * 3.0f / 4.0f);
+  const float logical_x = base_x + offset_x - (dst_width - 256.0f) * 0.5f;
+  const float logical_y = base_y + offset_y - (dst_height - 192.0f) * 0.5f;
+  DrasticScreenRect *rect = &config->custom_screens[screen];
+  rect->x = logical_x * (float)width / canvas_width;
+  rect->y = logical_y * (float)height / canvas_height;
+  rect->width = dst_width * (float)width / canvas_width;
+  rect->height = dst_height * (float)height / canvas_height;
+  rect->screen = screen;
+  rect->touch_target = screen == 1;
+}
+
 void drastic_config_load(DrasticRuntimeConfig *config) {
   memset(config, 0, sizeof(*config));
   /* The GBAStation launcher supplies the active ROM before preferences are
@@ -169,7 +200,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->firmware_userdata = firmware_language | (firmware_color << 8) |
                               (firmware_month << 16) | (firmware_day << 24);
   config->layout = read_layout();
-  config->swap_screens = prefs_get_bool("Wrapper/SwapScreens", false);
+  /* Screen swapping is intentionally not supported by the DraStic host UI. */
+  config->swap_screens = 0;
   config->rotation = clamp_int(prefs_get_int("Wrapper/Rotation", 0), 0, 3);
   config->screen_gap = clamp_int(prefs_get_int("Wrapper/ScreenGap", 8), 0, 128);
   config->integer_scale = prefs_get_bool("Wrapper/IntegerScale", false);
@@ -192,39 +224,29 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->mouse_stylus = prefs_get_bool("Wrapper/MouseStylus", true);
   config->motion_stylus_sensitivity = clamp_int(
       prefs_get_int("Wrapper/MotionStylusSensitivity", 10), 1, 20);
+  config->overlay_enabled = prefs_get_bool("Wrapper/OverlayEnabled", false);
+  snprintf(config->overlay_path, sizeof(config->overlay_path), "%s",
+           prefs_get_string("Wrapper/OverlayPath", ""));
+  snprintf(config->save_path, sizeof(config->save_path), "%s",
+           prefs_get_string("Wrapper/SavePath", ""));
+  snprintf(config->cheat_path, sizeof(config->cheat_path), "%s",
+           prefs_get_string("Wrapper/CheatPath", ""));
   config->stylus_x = 128;
   config->stylus_y = 96;
   config->core_config = drastic_config_build_core_config();
-  static const float defaults[2][4] = {
-    {0.30f, 0.04f, 0.40f, 0.40f},
-    {0.30f, 0.56f, 0.40f, 0.40f},
-  };
-  static const char *keys[2][4] = {
-    {"Wrapper/CustomTopX", "Wrapper/CustomTopY",
-     "Wrapper/CustomTopW", "Wrapper/CustomTopH"},
-    {"Wrapper/CustomBottomX", "Wrapper/CustomBottomY",
-     "Wrapper/CustomBottomW", "Wrapper/CustomBottomH"},
-  };
-  for (int screen = 0; screen < 2; screen++) {
-    config->custom_screens[screen].x = clamp_float(
-        prefs_get_float(keys[screen][0], defaults[screen][0]), 0.0f, 0.95f);
-    config->custom_screens[screen].y = clamp_float(
-        prefs_get_float(keys[screen][1], defaults[screen][1]), 0.0f, 0.95f);
-    config->custom_screens[screen].width = clamp_float(
-        prefs_get_float(keys[screen][2], defaults[screen][2]), 0.05f, 1.0f);
-    config->custom_screens[screen].height = clamp_float(
-        prefs_get_float(keys[screen][3], defaults[screen][3]), 0.05f, 1.0f);
-    if (config->custom_screens[screen].x +
-        config->custom_screens[screen].width > 1.0f)
-      config->custom_screens[screen].x =
-          1.0f - config->custom_screens[screen].width;
-    if (config->custom_screens[screen].y +
-        config->custom_screens[screen].height > 1.0f)
-      config->custom_screens[screen].y =
-          1.0f - config->custom_screens[screen].height;
-    config->custom_screens[screen].screen = screen;
-    config->custom_screens[screen].touch_target = screen == 1;
-  }
+  config->custom_top_scale = clamp_float(
+      prefs_get_float("Wrapper/CustomTopScale", 1.0f), 1.0f, 10.0f);
+  config->custom_top_offset_x = clamp_float(
+      prefs_get_float("Wrapper/CustomTopOffsetX", 0.0f), -1280.0f, 1280.0f);
+  config->custom_top_offset_y = clamp_float(
+      prefs_get_float("Wrapper/CustomTopOffsetY", 0.0f), -1280.0f, 1280.0f);
+  config->custom_bottom_scale = clamp_float(
+      prefs_get_float("Wrapper/CustomBottomScale", 1.0f), 1.0f, 10.0f);
+  config->custom_bottom_offset_x = clamp_float(
+      prefs_get_float("Wrapper/CustomBottomOffsetX", 0.0f), -1280.0f, 1280.0f);
+  config->custom_bottom_offset_y = clamp_float(
+      prefs_get_float("Wrapper/CustomBottomOffsetY", 0.0f), -1280.0f, 1280.0f);
+  /* Rectangles are derived below once the physical surface is known. */
 }
 
 static void fit_size(float available_width, float available_height,
@@ -262,10 +284,10 @@ void drastic_config_calculate_layout(DrasticRuntimeConfig *config,
 
   if (config->layout == DRASTIC_LAYOUT_CUSTOM) {
     for (int screen = 0; screen < 2; screen++) {
+      set_custom_canvas_rect(config, screen, width, height);
       const DrasticScreenRect *custom = &config->custom_screens[screen];
-      set_rect(config, screen, screen,
-               custom->x * width, custom->y * height,
-               custom->width * width, custom->height * height);
+      set_rect(config, screen, screen, custom->x, custom->y,
+               custom->width, custom->height);
     }
     config->screen_count = 2;
     return;

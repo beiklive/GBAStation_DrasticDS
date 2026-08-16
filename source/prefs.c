@@ -71,6 +71,143 @@ static void parse_file(const char *path) {
   fclose(file);
 }
 
+/* The launcher owns user-facing core settings in config.cfg.  Import the
+ * DraStic subset on every NRO launch so the host never silently reuses an old
+ * drastic.ini after the user changes a setting in BeikLiveStation. */
+static int launcher_config_value(const char *wanted, char *output,
+                                 size_t output_size) {
+  static const char *paths[] = {
+    "sdmc:/GBAStation/config/config.cfg",
+    "/GBAStation/config/config.cfg",
+  };
+  int found = 0;
+  if (!wanted || !output || !output_size) return 0;
+  output[0] = '\0';
+  for (unsigned path_index = 0;
+       path_index < sizeof(paths) / sizeof(*paths); path_index++) {
+    FILE *file = fopen(paths[path_index], "rb");
+    if (!file) continue;
+    char line[2048];
+    while (fgets(line, sizeof(line), file)) {
+      char *key = trim(line);
+      char *equals = strchr(key, '=');
+      if (!equals) continue;
+      *equals++ = '\0';
+      key = trim(key);
+      if (strcmp(key, wanted)) continue;
+      char *value = trim(equals);
+      /* config.cfg stores scalar values as `i|42`, `f|0.5`, or `s|text`. */
+      char *separator = strchr(value, '|');
+      if (separator && separator > value && separator <= value + 3)
+        value = separator + 1;
+      snprintf(output, output_size, "%s", trim(value));
+      found = 1; /* last record wins, matching the launcher config reader */
+    }
+    fclose(file);
+  }
+  return found;
+}
+
+static void import_launcher_core_config(void) {
+  static const struct {
+    const char *launcher_key;
+    const char *prefs_key;
+  } mappings[] = {
+    {"core.drastic.layout", "Wrapper/Layout"},
+    {"core.drastic.rotation", "Wrapper/Rotation"},
+    {"core.drastic.screen_gap", "Wrapper/ScreenGap"},
+    {"core.drastic.integer_scale", "Wrapper/IntegerScale"},
+    {"core.drastic.video_filter", "Wrapper/VideoFilter"},
+    {"core.drastic.swap_screens", "Wrapper/SwapScreens"},
+    {"core.drastic.volume", "Wrapper/Volume"},
+    {"core.drastic.microphone_source", "Wrapper/MicrophoneSource"},
+    {"core.drastic.vibration", "Wrapper/Vibration"},
+    {"core.drastic.motion", "Wrapper/Motion"},
+    {"core.drastic.stylus_mode", "Wrapper/StylusMode"},
+    {"core.drastic.stylus_speed", "Wrapper/AnalogStylusSpeed"},
+    {"core.drastic.frameskip", "Drastic/FrameskipValue"},
+    {"core.drastic.frameskip_type", "Drastic/FrameskipType"},
+    {"core.drastic.frameskip_safe", "Drastic/FrameskipSafe"},
+    {"core.drastic.fastforward_speed", "Drastic/FastForwardSpeed"},
+    {"core.drastic.audio_latency", "Drastic/AudioLatency"},
+    {"core.drastic.cpu_threads", "Drastic/CpuThreads"},
+    {"core.drastic.threaded_3d", "Drastic/Threaded3D"},
+    {"core.drastic.hires_3d", "Drastic/Hires3D"},
+    {"core.drastic.sound_enabled", "Drastic/SoundEnabled"},
+    {"core.drastic.cheats_enabled", "Drastic/CheatsEnabled"},
+    {"core.drastic.mic_enabled", "Drastic/MicEnabled"},
+    {"core.drastic.rtc_system_time", "Drastic/RtcSystemTime"},
+    {"core.drastic.preload_roms", "Drastic/PreloadRoms"},
+    {"core.drastic.show_fps", "Drastic/ShowFPS"},
+    {"core.drastic.autosave_interval", "Drastic/AutosaveInterval"},
+    {"core.drastic.autofire_speed", "Drastic/AutoFireSpeed"},
+    {"core.drastic.mic_level", "Drastic/MicLevel"},
+    {"core.drastic.slot2_type", "Drastic/Slot2Type"},
+    {"core.drastic.backup_in_savestates", "Drastic/BackupInSavestates"},
+    {"core.drastic.ignore_gamecard_limit", "Drastic/IgnoreGamecardLimit"},
+    {"core.drastic.use_16bit_color", "Drastic/Use16BitColor"},
+    {"core.drastic.auto_trim", "Drastic/AutoTrim"},
+    {"core.drastic.fix_main_engine_screen", "Drastic/FixMainEngineScreen"},
+    {"core.drastic.disable_edge_marking", "Drastic/DisableEdgeMarking"},
+    {"core.drastic.lua_enabled", "Drastic/LuaEnabled"},
+    {"core.drastic.blend", "Drastic/Blend"},
+    {"core.drastic.raw_save_format", "Drastic/RawSaveFormat"},
+    {"core.drastic.firmware_nickname", "Drastic/FirmwareNickname"},
+    {"core.drastic.firmware_language", "Drastic/FirmwareLanguage"},
+    {"core.drastic.firmware_color", "Drastic/FirmwareColor"},
+    {"core.drastic.firmware_birthday_month", "Drastic/FirmwareBirthdayMonth"},
+    {"core.drastic.firmware_birthday_day", "Drastic/FirmwareBirthdayDay"},
+    {"core.drastic.lsfg_flow_scale", "Wrapper/LSFGFlowScale"},
+    {"core.drastic.lsfg_performance", "Wrapper/LSFGPerformance"},
+  };
+  char value[PREFS_VAL_LEN];
+  for (unsigned index = 0; index < sizeof(mappings) / sizeof(*mappings);
+       index++) {
+    if (launcher_config_value(mappings[index].launcher_key, value,
+                              sizeof(value)))
+      put_entry(mappings[index].prefs_key, value);
+  }
+  if (launcher_config_value("core.drastic.lsfg_enabled", value,
+                            sizeof(value))) {
+    /* The launcher flag is an explicit permission boundary.  When disabled,
+     * the in-game menu must show the feature as unavailable rather than let a
+     * stale drastic.ini re-enable it. */
+    put_entry("Wrapper/LSFGAllowed", value);
+    put_entry("Wrapper/LSFGEnabled", value);
+  }
+}
+
+/* BeikLiveStation writes this one-shot profile immediately before it transfers
+ * control to the NRO.  The ROM guard prevents an older profile from affecting
+ * a direct launch, or a launch from another frontend. */
+static void import_game_launch_profile(void) {
+  static const char *paths[] = {
+    "sdmc:/GBAStation/drastic/launch.cfg",
+    "/GBAStation/drastic/launch.cfg",
+  };
+  for (unsigned index = 0; index < sizeof(paths) / sizeof(*paths); index++) {
+    FILE *file = fopen(paths[index], "rb");
+    if (!file) continue;
+    char line[2048];
+    char profile_rom[PREFS_VAL_LEN] = "";
+    while (fgets(line, sizeof(line), file)) {
+      char *key = trim(line);
+      char *equals = strchr(key, '=');
+      if (!equals) continue;
+      *equals++ = '\0';
+      if (!strcmp(trim(key), "Wrapper/LaunchRom")) {
+        snprintf(profile_rom, sizeof(profile_rom), "%s", trim(equals));
+        break;
+      }
+    }
+    fclose(file);
+    if (pending_rom[0] && !strcmp(profile_rom, pending_rom)) {
+      parse_file(paths[index]);
+      return;
+    }
+  }
+}
+
 static void seed_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
   seed("Drastic/RomPath", pending_rom[0] ? pending_rom : "");
@@ -89,22 +226,25 @@ static void seed_defaults(void) {
   seed("Wrapper/StylusMode", "stick");
   seed("Wrapper/MouseStylus", "true");
   seed("Wrapper/AnalogStylusSpeed", "8");
+  seed("Wrapper/LSFGAllowed", "false");
   seed("Wrapper/MotionStylusSensitivity", "10");
   seed("Wrapper/StateSlot", "0");
-  seed("Wrapper/CustomTopX", "0.30");
-  seed("Wrapper/CustomTopY", "0.04");
-  seed("Wrapper/CustomTopW", "0.40");
-  seed("Wrapper/CustomTopH", "0.40");
-  seed("Wrapper/CustomBottomX", "0.30");
-  seed("Wrapper/CustomBottomY", "0.56");
-  seed("Wrapper/CustomBottomW", "0.40");
-  seed("Wrapper/CustomBottomH", "0.40");
+  seed("Wrapper/CustomTopScale", "1.0");
+  seed("Wrapper/CustomTopOffsetX", "0");
+  seed("Wrapper/CustomTopOffsetY", "0");
+  seed("Wrapper/CustomBottomScale", "1.0");
+  seed("Wrapper/CustomBottomOffsetX", "0");
+  seed("Wrapper/CustomBottomOffsetY", "0");
+  seed("Wrapper/OverlayEnabled", "false");
+  seed("Wrapper/OverlayPath", "");
+  seed("Wrapper/SavePath", "");
+  seed("Wrapper/CheatPath", "");
 
   seed("Drastic/FrameskipValue", "0");
   seed("Drastic/FrameskipType", "0");
   seed("Drastic/FrameskipSafe", "false");
   seed("Drastic/AudioLatency", "2");
-  seed("Drastic/FastForwardSpeed", "2");
+  seed("Drastic/FastForwardSpeed", "5");
   seed("Drastic/CpuThreads", "3");
   seed("Drastic/AutoFireSpeed", "2");
   seed("Drastic/MicLevel", "1");
@@ -139,7 +279,7 @@ static void seed_defaults(void) {
 static void migrate_fast_forward_speed(void) {
   const int version = prefs_get_int("Wrapper/LauncherSettingsVersion", 0);
   if (version >= 3) return;
-  if (prefs_get_int("Drastic/FastForwardSpeed", 2) == 0)
+  if (prefs_get_int("Drastic/FastForwardSpeed", 5) == 2)
     put_entry("Drastic/FastForwardSpeed", "5");
   put_entry("Wrapper/LauncherSettingsVersion", "3");
 }
@@ -169,13 +309,19 @@ void prefs_init(const char *path) {
   prefs_remove("Wrapper/CpuBoost");
   prefs_remove("Wrapper/Renderer");
   prefs_remove("Wrapper/VulkanLowLatency");
-  prefs_remove("Wrapper/LSFGEnabled");
-  prefs_remove("Wrapper/LSFGFlowScale");
-  prefs_remove("Wrapper/LSFGPerformance");
+  /* LSFG is a Vulkan-only runtime option.  Preserve its user settings so the
+   * renderer can reserve its device/swapchain resources at the next launch. */
   prefs_remove("Wrapper/LSFGDllPath");
   migrate_stylus_mode();
   seed_defaults();
   migrate_fast_forward_speed();
+  import_launcher_core_config();
+  import_game_launch_profile();
+  /* The shared NDS save directory is also consumed by nds_stub.  DraStic's
+   * native .dsv format appends a DeSmuME footer and cannot safely share that
+   * file, so always request its raw, interoperable .sav output.  Do this
+   * after both launcher imports: a stale per-game profile must not undo it. */
+  put_entry("Drastic/RawSaveFormat", "true");
 }
 
 void prefs_save(void) {

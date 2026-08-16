@@ -30,6 +30,7 @@
 #include <switch.h>
 
 #include "config.h"
+#include "prefs.h"
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
@@ -258,6 +259,10 @@ const char *fix_path(const char *path) {
 
   if (!path)
     return path;
+  /* Match the JNI path cache: the core uses both DraStic/foo and
+   * /DraStic/foo depending on the call site. */
+  if (!strncmp(path, "/DraStic/", 9) || !strncmp(path, "/User/", 6))
+    path++;
   /* Drastic's native side also sends its Java virtual roots through direct
    * POSIX calls.  Keep this translation identical to DraSticPathCache.open. */
   if (!strncmp(path, "DraStic/", 8) || !strncmp(path, "User/", 5)) {
@@ -266,7 +271,19 @@ const char *fix_path(const char *path) {
     const char *root = drastic_root ? DATA_ROOT : USER_DIR;
     char *out = buf[which];
     which ^= 1;
-    snprintf(out, sizeof(buf[0]), "%s/%s", root, rest);
+    const char *save_root = prefs_get_string("Wrapper/SavePath", "");
+    if (save_root[0] &&
+        ((drastic_root && (!strncmp(rest, "backup/", 7) ||
+                            !strncmp(rest, "saves/", 6) ||
+                            !strncmp(rest, "battery/", 8) ||
+                            !strncmp(rest, "savestates/", 11))) ||
+         (!drastic_root && !strncmp(rest, "savestates/", 11)))) {
+      const char *name = strrchr(rest, '/');
+      snprintf(out, sizeof(buf[0]), "%s/%s", save_root,
+               name ? name + 1 : rest);
+    } else {
+      snprintf(out, sizeof(buf[0]), "%s/%s", root, rest);
+    }
     return out;
   }
   // Redirect Android application paths into the data directory.
@@ -282,7 +299,15 @@ const char *fix_path(const char *path) {
       const char *rest = path + plen;
       char *out = buf[which];
       which ^= 1;
-      snprintf(out, sizeof(buf[0]), "%s%s", DATA_ROOT, rest);
+      const char *save_root = prefs_get_string("Wrapper/SavePath", "");
+      if (save_root[0] &&
+          (!strncmp(rest, "/backup/", 8) || !strncmp(rest, "/saves/", 7) ||
+           !strncmp(rest, "/battery/", 9) || !strncmp(rest, "/savestates/", 12))) {
+        const char *name = strrchr(rest, '/');
+        snprintf(out, sizeof(buf[0]), "%s/%s", save_root, name ? name + 1 : rest);
+      } else {
+        snprintf(out, sizeof(buf[0]), "%s%s", DATA_ROOT, rest);
+      }
       return out;
     }
   }

@@ -19,6 +19,9 @@ typedef struct {
 
 void overlay_init(int rotation);
 void overlay_set_rotation(int rotation);
+bool overlay_set_png_mask(const char *path, bool enabled);
+bool overlay_draw_png_preview(const char *path, int x, int y, int width,
+                              int height);
 int overlay_width(void);
 int overlay_height(void);
 void overlay_begin(void);
@@ -31,6 +34,7 @@ void overlay_fill_rect(int x, int y, int width, int height, uint32_t color);
 void overlay_border_rect(int x, int y, int width, int height, int thickness,
                          uint32_t color);
 void overlay_draw_text(int x, int y, uint32_t color, const char *text);
+int overlay_text_width(const char *text);
 void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
                               const char *text);
 void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
@@ -41,6 +45,8 @@ void overlay_draw_text_scrolling_right(int right, int y, int max_width,
                                        uint32_t color, const char *text);
 void overlay_draw_text_right(int right, int y, uint32_t color,
                              const char *text);
+void overlay_draw_nintendo_glyph(int x, int y, int pixel_height,
+                                 uint32_t color, unsigned glyph);
 void overlay_draw_wrapped(int x, int y, int max_width, int max_lines,
                           uint32_t color, const char *text);
 void overlay_blit_snapshot(int x, int y, int width, int height,

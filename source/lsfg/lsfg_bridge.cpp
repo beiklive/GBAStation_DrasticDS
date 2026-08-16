@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg_bridge.h"
+#include "debug_log.h"
 
 #ifdef USE_VULKAN
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
+#include "extraction/dll_reader.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
@@ -17,12 +19,39 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+void logDllShaderResources(const char *path) {
+    if (!path || !*path) return;
+    try {
+        const auto resources = lsfgvk::backend::extractResourcesFromDLL(
+            std::filesystem::path(path));
+        std::vector<uint32_t> ids;
+        ids.reserve(resources.size());
+        for (const auto& entry : resources)
+            ids.push_back(entry.first);
+        std::sort(ids.begin(), ids.end());
+
+        /* The current registry first resolves logical shader 256 to resource
+         * 305 (FP16) or 354 (FP32). Keep this compact so a device log shows
+         * whether the installed DLL belongs to the expected resource family. */
+        const bool hasFp16 = resources.find(305) != resources.end();
+        const bool hasFp32 = resources.find(354) != resources.end();
+        const uint32_t first = ids.empty() ? 0 : ids.front();
+        const uint32_t last = ids.empty() ? 0 : ids.back();
+        debug_logf("lsfg DLL RCDATA: count=%u range=%u..%u shader256 fp16=%d fp32=%d",
+                   (unsigned)ids.size(), (unsigned)first, (unsigned)last,
+                   hasFp16, hasFp32);
+    } catch (const std::exception& error) {
+        debug_logf("lsfg DLL resource probe failed: %s", error.what());
+    }
+}
 
 VkImageMemoryBarrier imageBarrier(VkImage image,
         VkAccessFlags sourceAccess, VkAccessFlags destinationAccess,
@@ -330,9 +359,13 @@ extern "C" LsfgNxRuntime *lsfg_nx_create(const LsfgNxCreateInfo *info) {
     try {
         auto runtime = std::make_unique<LsfgNxRuntime>(*info);
         return runtime.release();
+    } catch (const std::exception& error) {
+        debug_logf("lsfg create failed: %s", error.what());
+        logDllShaderResources(info->shader_dll_path);
     } catch (...) {
-        return nullptr;
+        debug_logf("lsfg create failed: unknown exception");
     }
+    return nullptr;
 }
 
 extern "C" void lsfg_nx_destroy(LsfgNxRuntime *runtime) {
@@ -350,7 +383,10 @@ extern "C" bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,
     try {
         *result = runtime->present(queue, *presentInfo);
         return true;
+    } catch (const std::exception& error) {
+        debug_logf("lsfg present failed: %s", error.what());
     } catch (...) {
+        debug_logf("lsfg present failed: unknown exception");
     }
 
     *result = VK_ERROR_INITIALIZATION_FAILED;
@@ -358,5 +394,3 @@ extern "C" bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,
 }
 
 #endif /* USE_VULKAN */
-
-

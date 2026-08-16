@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -357,12 +358,40 @@ static void *stringset_for_key(const char *key) {
  * etc.  Mapping it directly to SYSTEM_DIR would turn
  * DraStic/system/foo into GBAStation/drastic/system/system/foo. */
 static int drastic_real_path(const char *virtual_path, char *output,
-                             size_t output_size) {
+                              size_t output_size) {
   if (!virtual_path || !output || !output_size) return 0;
-  if (!strncmp(virtual_path, "DraStic/", 8))
-    snprintf(output, output_size, "%s/%s", DATA_ROOT, virtual_path + 8);
-  else if (!strncmp(virtual_path, "User/", 5))
-    snprintf(output, output_size, "%s/%s", USER_DIR, virtual_path + 5);
+  /* Some core paths reach the Java cache with an optional leading slash while
+   * the same paths used by its POSIX side do not.  Treat both spellings as the
+   * same virtual root so persistence never escapes Wrapper/SavePath. */
+  if (!strncmp(virtual_path, "/DraStic/", 9) ||
+      !strncmp(virtual_path, "/User/", 6))
+    virtual_path++;
+  if (!strncmp(virtual_path, "DraStic/", 8)) {
+    const char *relative = virtual_path + 8;
+    /* GameDB savePath is the complete per-game persistence root: cartridge
+     * saves, DraStic savestates and screenshots belong together. */
+    const char *save_root = prefs_get_string("Wrapper/SavePath", "");
+    if (save_root[0] && (!strncmp(relative, "backup/", 7) ||
+                         !strncmp(relative, "saves/", 6) ||
+                         !strncmp(relative, "battery/", 8) ||
+                         !strncmp(relative, "savestates/", 11))) {
+      const char *name = strrchr(relative, '/');
+      snprintf(output, output_size, "%s/%s", save_root,
+               name ? name + 1 : relative);
+    } else {
+      snprintf(output, output_size, "%s/%s", DATA_ROOT, relative);
+    }
+  }
+  else if (!strncmp(virtual_path, "User/", 5)) {
+    const char *relative = virtual_path + 5;
+    const char *save_root = prefs_get_string("Wrapper/SavePath", "");
+    if (save_root[0] && !strncmp(relative, "savestates/", 11)) {
+      const char *name = strrchr(relative, '/');
+      snprintf(output, output_size, "%s/%s", save_root, name ? name + 1 : relative);
+    } else {
+      snprintf(output, output_size, "%s/%s", USER_DIR, relative);
+    }
+  }
   else if (virtual_path[0] == '/')
     snprintf(output, output_size, "%s", virtual_path);
   else {
@@ -398,7 +427,14 @@ static void drastic_resource_path(const char *virtual_path, const char *mode,
 
   if (!strcmp(relative, "usrcheat.dat") ||
       !strcmp(relative, "system/usrcheat.dat")) {
-    snprintf(real_path, real_path_size, "%s", CHEAT_DATABASE_PATH);
+    const char *configured = prefs_get_string("Wrapper/CheatPath", "");
+    const char *extension = configured[0] ? strrchr(configured, '.') : NULL;
+    if (configured[0] && extension && !strcasecmp(extension, ".dat"))
+      snprintf(real_path, real_path_size, "%s", configured);
+    else if (configured[0])
+      snprintf(real_path, real_path_size, "%s/usrcheat.dat", configured);
+    else
+      snprintf(real_path, real_path_size, "%s", CHEAT_DATABASE_PATH);
     return;
   }
 

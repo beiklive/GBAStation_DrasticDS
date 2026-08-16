@@ -5,12 +5,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <png.h>
+
 #include <freetype2/ft2build.h>
 #include FT_FREETYPE_H
 
 #include "overlay.h"
 
 static uint32_t g_pixels[DRASTIC_OVERLAY_PIXELS];
+static uint32_t g_mask_pixels[DRASTIC_OVERLAY_PIXELS];
 static DrasticOverlayFrame g_frame = {
   .pixels = g_pixels,
   .width = DRASTIC_OVERLAY_WIDTH,
@@ -21,10 +24,16 @@ static int g_font_ready;
 static FT_Library g_freetype;
 static FT_Face g_chinese_font;
 static int g_chinese_font_attempted;
+static FT_Face g_nintendo_font;
+static int g_nintendo_font_attempted;
 static uint64_t g_hud_generation = UINT64_MAX;
 static int g_hud_show_fps = -1;
 static int g_hud_fps_tenth = -2;
 static int g_hud_fast_forward = -1;
+static int g_mask_enabled;
+static char g_mask_path[1024];
+
+static uint32_t composite_argb(uint32_t destination, uint32_t source);
 
 static int clamp_int(int value, int minimum, int maximum) {
   if (value < minimum) return minimum;
@@ -50,6 +59,19 @@ static void overlay_init_chinese_font(void) {
   }
 }
 
+static void overlay_init_nintendo_font(void) {
+  if (g_nintendo_font_attempted) return;
+  g_nintendo_font_attempted = 1;
+  overlay_init_chinese_font();
+  if (!g_freetype) return;
+  PlFontData font_data;
+  if (R_FAILED(plGetSharedFontByType(&font_data, PlSharedFontType_NintendoExt)) ||
+      !font_data.address || !font_data.size)
+    return;
+  (void)FT_New_Memory_Face(g_freetype, (const FT_Byte *)font_data.address,
+                           (FT_Long)font_data.size, 0, &g_nintendo_font);
+}
+
 void overlay_init(int rotation) {
   PrintConsole *console = consoleGetDefault();
   if (console && console->font.gfx && console->font.tileWidth &&
@@ -58,11 +80,15 @@ void overlay_init(int rotation) {
     g_font_ready = 1;
   }
   overlay_init_chinese_font();
+  overlay_init_nintendo_font();
   g_frame.width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
                                  : DRASTIC_OVERLAY_WIDTH;
   g_frame.height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
                                   : DRASTIC_OVERLAY_HEIGHT;
   memset(g_pixels, 0, sizeof(g_pixels));
+  memset(g_mask_pixels, 0, sizeof(g_mask_pixels));
+  g_mask_enabled = 0;
+  g_mask_path[0] = '\0';
 }
 
 void overlay_set_rotation(int rotation) {
@@ -74,9 +100,93 @@ void overlay_set_rotation(int rotation) {
   g_frame.width = width;
   g_frame.height = height;
   memset(g_pixels, 0, sizeof(g_pixels));
+  if (g_mask_path[0]) {
+    char path[sizeof(g_mask_path)];
+    snprintf(path, sizeof(path), "%s", g_mask_path);
+    overlay_set_png_mask(path, true);
+  }
   g_frame.visible = false;
   g_frame.generation++;
   g_hud_generation = UINT64_MAX;
+}
+
+bool overlay_set_png_mask(const char *path, bool enabled) {
+  memset(g_mask_pixels, 0, sizeof(g_mask_pixels));
+  g_mask_enabled = 0;
+  g_mask_path[0] = '\0';
+  if (!enabled || !path || !path[0]) {
+    g_frame.generation++;
+    return true;
+  }
+
+  png_image image;
+  memset(&image, 0, sizeof(image));
+  image.version = PNG_IMAGE_VERSION;
+  if (!png_image_begin_read_from_file(&image, path)) return false;
+  image.format = PNG_FORMAT_RGBA;
+  const size_t bytes = PNG_IMAGE_SIZE(image);
+  png_bytep source = malloc(bytes);
+  if (!source) {
+    png_image_free(&image);
+    return false;
+  }
+  const int decoded = png_image_finish_read(&image, NULL, source, 0, NULL);
+  if (!decoded || !image.width || !image.height) {
+    free(source);
+    png_image_free(&image);
+    return false;
+  }
+  for (int y = 0; y < g_frame.height; y++) {
+    const unsigned source_y = (unsigned)y * image.height / (unsigned)g_frame.height;
+    for (int x = 0; x < g_frame.width; x++) {
+      const unsigned source_x = (unsigned)x * image.width / (unsigned)g_frame.width;
+      const png_byte *pixel = source +
+          ((size_t)source_y * image.width + source_x) * 4;
+      g_mask_pixels[(size_t)y * g_frame.width + x] =
+          ((uint32_t)pixel[3] << 24) | ((uint32_t)pixel[0] << 16) |
+          ((uint32_t)pixel[1] << 8) | pixel[2];
+    }
+  }
+  free(source);
+  png_image_free(&image);
+  g_mask_enabled = 1;
+  snprintf(g_mask_path, sizeof(g_mask_path), "%s", path);
+  g_hud_generation = UINT64_MAX;
+  g_frame.generation++;
+  return true;
+}
+
+bool overlay_draw_png_preview(const char *path, int x, int y, int width,
+                              int height) {
+  if (!path || !path[0] || width <= 0 || height <= 0) return false;
+  png_image image;
+  memset(&image, 0, sizeof(image));
+  image.version = PNG_IMAGE_VERSION;
+  if (!png_image_begin_read_from_file(&image, path)) return false;
+  image.format = PNG_FORMAT_RGBA;
+  const size_t bytes = PNG_IMAGE_SIZE(image);
+  png_bytep source = malloc(bytes);
+  if (!source) { png_image_free(&image); return false; }
+  const int decoded = png_image_finish_read(&image, NULL, source, 0, NULL);
+  if (!decoded || !image.width || !image.height) {
+    free(source);
+    png_image_free(&image);
+    return false;
+  }
+  for (int row = 0; row < height; row++) {
+    const unsigned source_y = (unsigned)row * image.height / (unsigned)height;
+    for (int column = 0; column < width; column++) {
+      const unsigned source_x = (unsigned)column * image.width / (unsigned)width;
+      const png_byte *pixel = source +
+          ((size_t)source_y * image.width + source_x) * 4;
+      const uint32_t color = ((uint32_t)pixel[3] << 24) |
+          ((uint32_t)pixel[0] << 16) | ((uint32_t)pixel[1] << 8) | pixel[2];
+      overlay_fill_rect(x + column, y + row, 1, 1, color);
+    }
+  }
+  free(source);
+  png_image_free(&image);
+  return true;
 }
 
 int overlay_width(void) { return g_frame.width; }
@@ -85,6 +195,11 @@ int overlay_height(void) { return g_frame.height; }
 
 void overlay_begin(void) {
   memset(g_pixels, 0, sizeof(g_pixels));
+  if (g_mask_enabled) {
+    const size_t count = (size_t)g_frame.width * g_frame.height;
+    for (size_t index = 0; index < count; index++)
+      g_pixels[index] = composite_argb(g_pixels[index], g_mask_pixels[index]);
+  }
   g_frame.visible = true;
 }
 
@@ -94,6 +209,11 @@ void overlay_finish(void) {
 }
 
 void overlay_hide(void) {
+  if (g_mask_enabled) {
+    overlay_begin();
+    overlay_finish();
+    return;
+  }
   if (g_frame.visible) {
     g_frame.visible = false;
     g_frame.generation++;
@@ -123,17 +243,13 @@ void overlay_draw_hud(bool show_fps, float fps, bool fast_forward) {
     return;
 
   enum {
-    HUD_MARGIN = 18,
-    HUD_HEIGHT = 40,
-    HUD_GAP = 8,
-    HUD_FPS_WIDTH = 168,
-    HUD_FAST_FORWARD_WIDTH = 272,
+    HUD_MARGIN = 4,
+    HUD_HEIGHT = 22,
+    HUD_WIDTH = 90,
   };
-  const uint32_t background = 0xf018202cu;
-  const uint32_t border = 0xff2bc3d9u;
-  const uint32_t text = 0xfff1f5f9u;
-  const int right = g_frame.width - HUD_MARGIN;
-  int top = HUD_MARGIN;
+  const uint32_t background = 0xa8000000u;
+  const uint32_t fps_text = 0xe600ff4fu;
+  const uint32_t fast_forward_text = 0xe663dcffu;
 
   overlay_begin();
   if (show_fps) {
@@ -143,19 +259,13 @@ void overlay_draw_hud(bool show_fps, float fps, bool fast_forward) {
     else
       snprintf(label, sizeof(label), "FPS %3d.%d",
                fps_tenth / 10, fps_tenth % 10);
-    const int left = right - HUD_FPS_WIDTH;
-    overlay_fill_rect(left, top, HUD_FPS_WIDTH, HUD_HEIGHT, background);
-    overlay_border_rect(left, top, HUD_FPS_WIDTH, HUD_HEIGHT, 2, border);
-    overlay_draw_text(left + 16, top + 12, text, label);
-    top += HUD_HEIGHT + HUD_GAP;
+    overlay_fill_rect(HUD_MARGIN, HUD_MARGIN, HUD_WIDTH, HUD_HEIGHT, background);
+    overlay_draw_text(HUD_MARGIN + 6, HUD_MARGIN + 4, fps_text, label);
   }
   if (fast_forward) {
-    const int left = right - HUD_FAST_FORWARD_WIDTH;
-    overlay_fill_rect(left, top, HUD_FAST_FORWARD_WIDTH, HUD_HEIGHT,
-                      background);
-    overlay_border_rect(left, top, HUD_FAST_FORWARD_WIDTH, HUD_HEIGHT, 2,
-                        border);
-    overlay_draw_text(left + 16, top + 12, text, ">> FAST FORWARD");
+    const int left = g_frame.width - HUD_MARGIN - HUD_WIDTH;
+    overlay_fill_rect(left, HUD_MARGIN, HUD_WIDTH, HUD_HEIGHT, background);
+    overlay_draw_text(left + 30, HUD_MARGIN + 4, fast_forward_text, ">>>");
   }
   overlay_finish();
   g_hud_show_fps = show_fps;
@@ -276,9 +386,11 @@ static int overlay_decode_utf8(const unsigned char **cursor) {
 }
 
 static int unicode_character_width(unsigned character, int scale) {
-  if (character < 0x80) return g_font.tileWidth * scale;
   if (!g_chinese_font) return g_font.tileWidth * scale;
-  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, g_font.tileHeight * scale) != 0 ||
+  /* The menu uses the Switch shared font.  Give every menu text run one extra
+   * raster pixel while keeping the existing scale semantics for headings. */
+  const int pixel_height = g_font.tileHeight * scale + 1;
+  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, pixel_height) != 0 ||
       FT_Load_Char(g_chinese_font, character, FT_LOAD_DEFAULT) != 0)
     return g_font.tileWidth * scale;
   int advance = (int)(g_chinese_font->glyph->advance.x >> 6);
@@ -287,19 +399,43 @@ static int unicode_character_width(unsigned character, int scale) {
 
 static void draw_unicode_character(int x, int y, int scale, uint32_t color,
                                    unsigned character) {
-  if (character < 0x80 || !g_chinese_font) {
+  /* The Switch Simplified-Chinese shared face also includes Latin, digits and
+   * punctuation.  Rendering every glyph through it prevents the old libnx
+   * ConsoleFont bitmap fallback from leaking into the DraStic UI. */
+  if (!g_chinese_font) {
     draw_ascii_character(x, y, scale, color, character);
     return;
   }
-  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, g_font.tileHeight * scale) != 0 ||
+  const int pixel_height = g_font.tileHeight * scale + 1;
+  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, pixel_height) != 0 ||
       FT_Load_Char(g_chinese_font, character, FT_LOAD_RENDER) != 0) {
     draw_ascii_character(x, y, scale, color, '?');
     return;
   }
 
   const FT_Bitmap *bitmap = &g_chinese_font->glyph->bitmap;
-  const int top = y + g_font.tileHeight * scale - g_chinese_font->glyph->bitmap_top;
+  const int top = y + pixel_height - g_chinese_font->glyph->bitmap_top;
   const int left = x + g_chinese_font->glyph->bitmap_left;
+  for (unsigned row = 0; row < bitmap->rows; row++) {
+    const unsigned char *pixels = bitmap->buffer + row * bitmap->pitch;
+    for (unsigned column = 0; column < bitmap->width; column++) {
+      const unsigned alpha = pixels[column];
+      if (alpha)
+        overlay_fill_rect(left + (int)column, top + (int)row, 1, 1,
+                          color_with_alpha(color, alpha));
+    }
+  }
+}
+
+void overlay_draw_nintendo_glyph(int x, int y, int pixel_height,
+                                 uint32_t color, unsigned glyph) {
+  if (!g_nintendo_font || pixel_height <= 0 ||
+      FT_Set_Pixel_Sizes(g_nintendo_font, 0, pixel_height) != 0 ||
+      FT_Load_Char(g_nintendo_font, glyph, FT_LOAD_RENDER) != 0)
+    return;
+  const FT_Bitmap *bitmap = &g_nintendo_font->glyph->bitmap;
+  const int top = y + pixel_height - g_nintendo_font->glyph->bitmap_top;
+  const int left = x + g_nintendo_font->glyph->bitmap_left;
   for (unsigned row = 0; row < bitmap->rows; row++) {
     const unsigned char *pixels = bitmap->buffer + row * bitmap->pitch;
     for (unsigned column = 0; column < bitmap->width; column++) {
@@ -331,6 +467,14 @@ void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
 
 void overlay_draw_text(int x, int y, uint32_t color, const char *text) {
   overlay_draw_text_scaled(x, y, 1, color, text);
+}
+
+int overlay_text_width(const char *text) {
+  if (!text || !g_font_ready) return 0;
+  int width = 0;
+  const unsigned char *cursor = (const unsigned char *)text;
+  while (*cursor) width += unicode_character_width(overlay_decode_utf8(&cursor), 1);
+  return width;
 }
 
 void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,

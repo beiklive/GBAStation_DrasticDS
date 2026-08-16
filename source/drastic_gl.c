@@ -72,6 +72,7 @@ static int g_texture_height;
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
 static int g_filter_valid[2];
 static unsigned g_frames;
+static unsigned g_captures;
 static GlCustomState g_custom;
 static char g_renderer_error[512];
 
@@ -870,6 +871,7 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glActiveTexture(GL_TEXTURE0);
     core_render(env, clazz, (int)g_textures[0], (int)g_textures[1], 0);
+    g_captures++;
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
 
@@ -915,6 +917,8 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   eglSwapBuffers(g_display, g_surface);
   g_frames++;
 }
+
+bool drastic_renderer_acquire_next_frame(void) { return false; }
 
 void drastic_renderer_suspend(void) {
   if (g_display != EGL_NO_DISPLAY && g_context != EGL_NO_CONTEXT)
@@ -965,6 +969,8 @@ void drastic_renderer_shutdown(void) {
 }
 
 unsigned drastic_renderer_frame_count(void) { return g_frames; }
+unsigned drastic_renderer_capture_count(void) { return g_captures; }
+unsigned drastic_renderer_changed_capture_count(void) { return 0; }
 
 bool drastic_renderer_lsfg_available(void) { return false; }
 
@@ -974,6 +980,7 @@ bool drastic_renderer_lsfg_request_enabled(bool enabled) {
   (void)enabled;
   return false;
 }
+bool drastic_renderer_lsfg_dll_available(void) { return false; }
 
 #endif
 
