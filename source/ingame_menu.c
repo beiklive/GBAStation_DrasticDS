@@ -11,7 +11,10 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <png.h>
+
 #include "config.h"
+#include "debug_log.h"
 #include "drastic_renderer.h"
 #include "gamedb.h"
 #include "ingame_menu.h"
@@ -54,6 +57,9 @@ typedef struct {
   int parent;
   int depth;
   int expanded;
+  int custom_index;
+  int32_t *code_words;
+  int code_word_count;
 } MenuCheat;
 
 struct DrasticIngameMenu {
@@ -70,6 +76,7 @@ struct DrasticIngameMenu {
   int exit_requested;
   int redraw;
   int pending_snapshot;
+  int pending_snapshot_slot;
   int confirm_delete_slot;
   int snapshot_valid;
   int32_t *snapshot_top;
@@ -303,7 +310,7 @@ static void copy_java_bytes(void *array, char *destination, size_t size) {
   jni_release_byte_array(array);
 }
 
-static void refresh_snapshot(DrasticIngameMenu *menu) {
+static void refresh_snapshot_for_slot(DrasticIngameMenu *menu, int slot) {
   if (!menu->core.get_snapshots || !menu->snapshot_top ||
       !menu->snapshot_bottom) {
     menu->snapshot_valid = 0;
@@ -312,7 +319,7 @@ static void refresh_snapshot(DrasticIngameMenu *menu) {
   memset(menu->snapshot_top, 0, 256 * 192 * sizeof(*menu->snapshot_top));
   memset(menu->snapshot_bottom, 0, 256 * 192 * sizeof(*menu->snapshot_bottom));
   menu->core.get_snapshots(menu->core.env, menu->core.clazz,
-                           *menu->state_slot, menu->snapshot_top_array,
+                           slot, menu->snapshot_top_array,
                            menu->snapshot_bottom_array);
   menu->snapshot_valid = 0;
   for (int index = 0; index < 256 * 192; index++) {
@@ -337,6 +344,103 @@ static int state_filename_matches_slot(const char *name, int slot) {
 static const char *state_directory(const DrasticIngameMenu *menu) {
   return menu && menu->config && menu->config->save_path[0]
       ? menu->config->save_path : SAVESTATES_DIR;
+}
+
+/* The core owns state filenames. Derive a preview name from the actual .dss
+ * file so per-game save roots never need to guess the ROM title. */
+static int state_preview_path_for_slot(const DrasticIngameMenu *menu, int slot,
+                                       char *path, size_t path_size) {
+  if (!path || !path_size) return 0;
+  path[0] = '\0';
+  const char *directory_path = state_directory(menu);
+  DIR *directory = opendir(directory_path);
+  struct dirent *entry;
+  while (directory && (entry = readdir(directory)) != NULL) {
+    if (!state_filename_matches_slot(entry->d_name, slot)) continue;
+    const size_t name_length = strlen(entry->d_name);
+    const int written = snprintf(path, path_size, "%s/%.*s.png",
+                                 directory_path, (int)(name_length - 4),
+                                 entry->d_name);
+    closedir(directory);
+    return written > 0 && (size_t)written < path_size;
+  }
+  if (directory) closedir(directory);
+  return 0;
+}
+
+static int snapshot_uses_argb(const int32_t *pixels, int pixel_count) {
+  if (!pixels || pixel_count <= 0) return 0;
+  for (int index = 0; index < pixel_count; index += 257) {
+    const uint32_t pixel = (uint32_t)pixels[index];
+    if ((pixel & 0xffff0000u) && pixel != 0xffffffffu) return 1;
+  }
+  return 0;
+}
+
+static void snapshot_to_rgba(const int32_t *source, uint8_t *destination,
+                             int pixel_count) {
+  const int argb = snapshot_uses_argb(source, pixel_count);
+  for (int index = 0; index < pixel_count; index++) {
+    uint32_t pixel = (uint32_t)source[index];
+    if (!argb) {
+      const uint16_t rgb565 = (uint16_t)pixel;
+      const unsigned red = (rgb565 >> 11) & 31;
+      const unsigned green = (rgb565 >> 5) & 63;
+      const unsigned blue = rgb565 & 31;
+      pixel = 0xff000000u | ((red * 255 / 31) << 16) |
+              ((green * 255 / 63) << 8) | (blue * 255 / 31);
+    } else if (!(pixel & 0xff000000u)) {
+      pixel |= 0xff000000u;
+    }
+    uint8_t *rgba = destination + (size_t)index * 4;
+    rgba[0] = (uint8_t)(pixel >> 16);
+    rgba[1] = (uint8_t)(pixel >> 8);
+    rgba[2] = (uint8_t)pixel;
+    rgba[3] = (uint8_t)(pixel >> 24);
+  }
+}
+
+static int write_state_preview_png(const DrasticIngameMenu *menu, int slot) {
+  if (!menu || !menu->snapshot_valid) return 0;
+  char path[1200];
+  if (!state_preview_path_for_slot(menu, slot, path, sizeof(path))) return 0;
+
+  const size_t screen_pixels = 256u * 192u;
+  uint8_t *rgba = malloc(screen_pixels * 2u * 4u);
+  if (!rgba) return 0;
+  snapshot_to_rgba(menu->snapshot_top, rgba, (int)screen_pixels);
+  snapshot_to_rgba(menu->snapshot_bottom, rgba + screen_pixels * 4u,
+                   (int)screen_pixels);
+  png_image image;
+  memset(&image, 0, sizeof(image));
+  image.version = PNG_IMAGE_VERSION;
+  image.width = 256;
+  image.height = 384;
+  image.format = PNG_FORMAT_RGBA;
+  const int written = png_image_write_to_file(&image, path, 0, rgba, 0, NULL);
+  free(rgba);
+  if (written) debug_logf("state preview saved slot=%d path=%s", slot, path);
+  else debug_logf("state preview write failed slot=%d path=%s", slot, path);
+  return written;
+}
+
+void drastic_menu_note_state_save(DrasticIngameMenu *menu, int slot) {
+  if (!menu || slot < 0 || slot > 9) return;
+  menu->pending_snapshot = 1;
+  menu->pending_snapshot_slot = slot;
+}
+
+void drastic_menu_poll(DrasticIngameMenu *menu) {
+  if (!menu || !menu->pending_snapshot) return;
+  if (menu->core.is_saving &&
+      menu->core.is_saving(menu->core.env, menu->core.clazz)) return;
+  const int slot = menu->pending_snapshot_slot;
+  menu->pending_snapshot = 0;
+  menu->pending_snapshot_slot = -1;
+  refresh_snapshot_for_slot(menu, slot);
+  set_status(menu, write_state_preview_png(menu, slot)
+                       ? "即时存档完成，已生成预览图"
+                       : "即时存档完成，但预览图写入失败");
 }
 
 static int delete_matching_state(DrasticIngameMenu *menu, int slot) {
@@ -373,23 +477,59 @@ static int delete_matching_state(DrasticIngameMenu *menu, int slot) {
   }
   if (directory) closedir(directory);
   const int deleted = matches == 1 && remove(matched_path) == 0;
+  if (deleted) {
+    const size_t state_length = strlen(matched_path);
+    if (state_length > 4) {
+      char preview_path[1200];
+      snprintf(preview_path, sizeof(preview_path), "%.*s.png",
+               (int)(state_length - 4), matched_path);
+      (void)remove(preview_path);
+    }
+  }
   jni_release_int_array(top_array);
   jni_release_int_array(bottom_array);
   return deleted;
 }
 
 static void free_cheats(DrasticIngameMenu *menu) {
+  for (int index = 0; menu && index < menu->cheat_count; index++)
+    free(menu->cheats[index].code_words);
   free(menu->cheats);
   menu->cheats = NULL;
   menu->cheat_count = 0;
   menu->folder_count = 0;
 }
 
+static void refresh_cheats(DrasticIngameMenu *menu);
+static int set_database_cheat_enabled(DrasticIngameMenu *menu,
+                                      MenuCheat *cheat, int enabled);
+
 static void invalidate_cheat_cache(DrasticIngameMenu *menu) {
   if (!menu) return;
   menu->cheats_loaded = 0;
   menu->cheats_rom_path[0] = '\0';
   menu->cheats_database_path[0] = '\0';
+}
+
+/* DraStic retains its custom-cheat list independently of the database list.
+ * In particular, records registered by an earlier game (or by the old broken
+ * repeated-registration path) survive into the next launch.  The R4 database
+ * selection below is our source of truth, so clear that stale list before
+ * restoring the selected records for the current ROM. */
+static void clear_stale_custom_cheats(DrasticIngameMenu *menu) {
+  if (!menu || !menu->core.get_custom_cheat_count ||
+      !menu->core.remove_custom_cheat)
+    return;
+  const int before = clamp_int(
+      menu->core.get_custom_cheat_count(menu->core.env, menu->core.clazz),
+      0, MENU_CHEAT_LIMIT);
+  for (int index = before - 1; index >= 0; index--)
+    menu->core.remove_custom_cheat(menu->core.env, menu->core.clazz, index);
+  const int after = clamp_int(
+      menu->core.get_custom_cheat_count(menu->core.env, menu->core.clazz),
+      0, MENU_CHEAT_LIMIT);
+  if (before || after)
+    debug_logf("cheats custom reset count=%d->%d", before, after);
 }
 
 static int hex_digit_value(int character) {
@@ -427,15 +567,33 @@ static int enabled_list_contains(const char *list, int wanted) {
 void drastic_menu_apply_persisted_cheats(DrasticIngameMenu *menu) {
   if (!menu || menu->persisted_cheats_applied) return;
   menu->persisted_cheats_applied = 1;
-  if (!prefs_contains("Wrapper/EnabledDatabaseCheats") ||
-      !menu->core.get_cheat_count || !menu->core.set_cheat_enabled) return;
+  clear_stale_custom_cheats(menu);
+  if (!prefs_contains("Wrapper/EnabledDatabaseCheats")) return;
   const char *enabled = prefs_get_string("Wrapper/EnabledDatabaseCheats", "");
   const int count = clamp_int(
-      menu->core.get_cheat_count(menu->core.env, menu->core.clazz),
+      menu->core.get_cheat_count
+          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0,
       0, MENU_CHEAT_LIMIT);
-  for (int index = 0; index < count; index++)
-    menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz, index,
-                                 enabled_list_contains(enabled, index));
+  debug_logf("cheats restore core_count=%d enabled=%s", count, enabled);
+  if (count > 0 && menu->core.set_cheat_enabled) {
+    for (int index = 0; index < count; index++)
+      menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz, index,
+                                   enabled_list_contains(enabled, index));
+  } else {
+    /* This core build exposes the custom-cheat JNI API but does not populate
+     * its database list.  Inject the R4 records selected in our menu instead
+     * of treating their parsed indices as nonexistent core indices. */
+    refresh_cheats(menu);
+    int injected = 0;
+    for (int index = 0; index < menu->cheat_count; index++) {
+      MenuCheat *cheat = &menu->cheats[index];
+      if (!cheat->is_category && cheat->enabled &&
+          set_database_cheat_enabled(menu, cheat, 1))
+        injected++;
+    }
+    debug_logf("cheats restore injected=%d parsed=%d", injected,
+               menu->cheat_count);
+  }
   if (menu->core.update_cheats)
     menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
 }
@@ -593,8 +751,20 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
       snprintf(entry->name, sizeof(entry->name), "%s", name[0] ? name : note);
       snprintf(entry->note, sizeof(entry->note), "%s", note);
       entry->index = code_index++; entry->parent = parent; entry->depth = depth;
-      entry->enabled = menu->core.get_cheat_enabled &&
-          menu->core.get_cheat_enabled(menu->core.env, menu->core.clazz, entry->index);
+      entry->custom_index = -1;
+      entry->code_word_count = (int)words;
+      entry->code_words = malloc((size_t)words * sizeof(*entry->code_words));
+      if (!entry->code_words) { menu->cheat_count--; break; }
+      for (uint32_t word = 0; word < words; word++)
+        entry->code_words[word] = (int32_t)cheat_le32(data + pos + word * 4);
+      const int core_count = menu->core.get_cheat_count
+          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0;
+      entry->enabled = core_count > 0 && menu->core.get_cheat_enabled
+          ? menu->core.get_cheat_enabled(menu->core.env, menu->core.clazz,
+                                         entry->index)
+          : enabled_list_contains(
+                prefs_get_string("Wrapper/EnabledDatabaseCheats", ""),
+                entry->index);
       pos += (size_t)words * 4;
     }
     if (!category && stack_size) {
@@ -604,8 +774,71 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
   }
   free(data);
   if (!menu->cheat_count) { free_cheats(menu); set_status(menu, "当前游戏没有可用金手指"); }
+  debug_logf("cheats database=%s parsed=%d core_count=%d", path,
+             menu->cheat_count,
+             menu->core.get_cheat_count
+                 ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz)
+                 : -1);
   menu->selection[MENU_CHEATS] = 0;
   menu->redraw = 1;
+}
+
+static void refresh_snapshot(DrasticIngameMenu *menu) {
+  refresh_snapshot_for_slot(menu, *menu->state_slot);
+}
+
+static int set_database_cheat_enabled(DrasticIngameMenu *menu,
+                                      MenuCheat *cheat, int enabled) {
+  if (!menu || !cheat || cheat->is_category) return 0;
+  const int core_count = menu->core.get_cheat_count
+      ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0;
+  if (core_count > 0 && menu->core.set_cheat_enabled) {
+    menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz,
+                                 cheat->index, enabled);
+    cheat->enabled = enabled;
+    return 1;
+  }
+  if (!menu->core.add_custom_cheat || !menu->core.set_custom_cheat_enabled ||
+      !cheat->code_words || cheat->code_word_count < 2)
+    return 0;
+  if (enabled && cheat->custom_index < 0) {
+    void *array = jni_make_int_array(cheat->code_word_count);
+    int32_t *words = jni_int_array_data(array);
+    if (!words) return 0;
+    memcpy(words, cheat->code_words,
+           (size_t)cheat->code_word_count * sizeof(*words));
+    void *name = jni_make_string(cheat->name);
+    const int before = menu->core.get_custom_cheat_count
+        ? menu->core.get_custom_cheat_count(menu->core.env, menu->core.clazz) : 0;
+    const int added = menu->core.add_custom_cheat(
+        menu->core.env, menu->core.clazz, name, array,
+        cheat->code_word_count, 1);
+    jni_release_string(name);
+    jni_release_int_array(array);
+    /* DraStic's JNI method returns 0 even when it accepted the record.  The
+     * only reliable acknowledgement is that its custom-cheat list grew.
+     * Treating that return value as a boolean left custom_index at -1, so the
+     * UI appeared off while every click registered another, shifted record. */
+    const int after = menu->core.get_custom_cheat_count
+        ? menu->core.get_custom_cheat_count(menu->core.env, menu->core.clazz)
+        : before;
+    debug_logf("cheats custom add database_index=%d words=%d result=%d slot=%d count=%d->%d",
+               cheat->index, cheat->code_word_count, added, before, before,
+               after);
+    if (after <= before) return 0;
+    cheat->custom_index = before;
+  }
+  if (cheat->custom_index < 0) return !enabled;
+  menu->core.set_custom_cheat_enabled(menu->core.env, menu->core.clazz,
+                                       cheat->custom_index, enabled);
+  cheat->enabled = enabled;
+  const int reported = menu->core.get_custom_cheat_enabled
+      ? menu->core.get_custom_cheat_enabled(menu->core.env, menu->core.clazz,
+                                             cheat->custom_index) != 0
+      : -1;
+  debug_logf("cheats custom state database_index=%d slot=%d requested=%d reported=%d",
+             cheat->index, cheat->custom_index, enabled, reported);
+  return 1;
 }
 
 static int prompt_keyboard(const char *header, const char *guide,
@@ -1732,7 +1965,7 @@ static void update_states(DrasticIngameMenu *menu, u64 pressed) {
   if (saving_page && (pressed & HidNpadButton_A) && menu->core.save_state) {
     const int result = menu->core.save_state(menu->core.env, menu->core.clazz,
                                              slot, 1);
-    menu->pending_snapshot = result != 0;
+    if (result) drastic_menu_note_state_save(menu, slot);
     set_status(menu, result ? "已请求保存即时存档" :
                               "无法保存到此槽位");
   }
@@ -1782,13 +2015,19 @@ static void update_cheats(DrasticIngameMenu *menu, u64 pressed) {
     return;
   }
   if (pressed & HidNpadButton_A) {
-    cheat->enabled ^= 1;
-    if (menu->core.set_cheat_enabled)
-      menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz,
-                                   cheat->index, cheat->enabled);
+    const int enabled = !cheat->enabled;
+    if (!set_database_cheat_enabled(menu, cheat, enabled)) {
+      set_status(menu, "无法将此金手指注册到 DraStic 核心");
+      return;
+    }
     if (menu->core.update_cheats)
       menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
     persist_database_cheats(menu);
+    debug_logf("cheats set visible_index=%d database_index=%d custom_index=%d enabled=%d core_count=%d",
+               selected, cheat->index, cheat->custom_index, cheat->enabled,
+               menu->core.get_cheat_count
+                   ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz)
+                   : -1);
     set_status(menu, cheat->enabled ? "金手指已启用" : "金手指已关闭");
   }
 }
@@ -2396,6 +2635,7 @@ DrasticIngameMenu *drastic_menu_create(DrasticRuntimeConfig *config,
   menu->core = *core;
   menu->state_slot = state_slot;
   menu->confirm_delete_slot = -1;
+  menu->pending_snapshot_slot = -1;
   menu->snapshot_top_array = jni_make_int_array(256 * 192);
   menu->snapshot_bottom_array = jni_make_int_array(256 * 192);
   menu->snapshot_top = jni_int_array_data(menu->snapshot_top_array);
@@ -2475,12 +2715,7 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
     menu->hint_until = 0;
     menu->redraw = 1;
   }
-  if (menu->pending_snapshot && (!menu->core.is_saving ||
-      !menu->core.is_saving(menu->core.env, menu->core.clazz))) {
-    menu->pending_snapshot = 0;
-    refresh_snapshot(menu);
-    set_status(menu, "即时存档完成");
-  }
+  drastic_menu_poll(menu);
   if (menu->page == MENU_AUDIO_INPUT) {
     const OpenSLESMicrophoneStatus microphone_status =
         opensles_get_microphone_status();

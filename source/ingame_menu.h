@@ -53,6 +53,10 @@ void drastic_menu_destroy(DrasticIngameMenu *menu);
 void drastic_menu_open(DrasticIngameMenu *menu);
 void drastic_menu_close(DrasticIngameMenu *menu, bool resume_core);
 bool drastic_menu_is_open(const DrasticIngameMenu *menu);
+/* Records a successful save requested outside the menu (for example a mapped
+ * quick-save hotkey) so it receives the same standalone PNG preview. */
+void drastic_menu_note_state_save(DrasticIngameMenu *menu, int slot);
+void drastic_menu_poll(DrasticIngameMenu *menu);
 void drastic_menu_apply_persisted_cheats(DrasticIngameMenu *menu);
 void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
                          HidAnalogStickState left,

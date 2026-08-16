@@ -80,7 +80,9 @@ uint64_t drastic_config_build_core_config(void) {
   value |= flag_if(prefs_get_bool("Drastic/FixMainEngineScreen", false), 35);
   value |= flag_if(prefs_get_bool("Drastic/RtcSystemTime", true), 39);
   value |= flag_if(prefs_get_bool("Drastic/DisableEdgeMarking", false), 40);
-  value |= flag_if(prefs_get_bool("Drastic/Hires3D", false), 41);
+  /* Keep the 3D rasterizer at its only supported higher internal resolution
+   * (2x).  This does not alter native-resolution NDS 2D backgrounds/sprites. */
+  value |= flag_if(true, 41);
   value |= flag_if(prefs_get_bool("Drastic/LuaEnabled", true), 42);
   value |= flag_if(prefs_get_bool("Drastic/FrameskipSafe", false), 47);
   value |= flag_if(prefs_get_bool("Drastic/PreloadRoms", true), 48);

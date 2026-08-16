@@ -368,16 +368,18 @@ static int drastic_real_path(const char *virtual_path, char *output,
     virtual_path++;
   if (!strncmp(virtual_path, "DraStic/", 8)) {
     const char *relative = virtual_path + 8;
+    const char *persistence = !strncmp(relative, "user/", 5)
+        ? relative + 5 : relative;
     /* GameDB savePath is the complete per-game persistence root: cartridge
      * saves, DraStic savestates and screenshots belong together. */
     const char *save_root = prefs_get_string("Wrapper/SavePath", "");
-    if (save_root[0] && (!strncmp(relative, "backup/", 7) ||
-                         !strncmp(relative, "saves/", 6) ||
-                         !strncmp(relative, "battery/", 8) ||
-                         !strncmp(relative, "savestates/", 11))) {
-      const char *name = strrchr(relative, '/');
+    if (save_root[0] && (!strncmp(persistence, "backup/", 7) ||
+                         !strncmp(persistence, "saves/", 6) ||
+                         !strncmp(persistence, "battery/", 8) ||
+                         !strncmp(persistence, "savestates/", 11))) {
+      const char *name = strrchr(persistence, '/');
       snprintf(output, output_size, "%s/%s", save_root,
-               name ? name + 1 : relative);
+                name ? name + 1 : persistence);
     } else {
       snprintf(output, output_size, "%s/%s", DATA_ROOT, relative);
     }
@@ -385,7 +387,10 @@ static int drastic_real_path(const char *virtual_path, char *output,
   else if (!strncmp(virtual_path, "User/", 5)) {
     const char *relative = virtual_path + 5;
     const char *save_root = prefs_get_string("Wrapper/SavePath", "");
-    if (save_root[0] && !strncmp(relative, "savestates/", 11)) {
+    if (save_root[0] && (!strncmp(relative, "backup/", 7) ||
+                         !strncmp(relative, "saves/", 6) ||
+                         !strncmp(relative, "battery/", 8) ||
+                         !strncmp(relative, "savestates/", 11))) {
       const char *name = strrchr(relative, '/');
       snprintf(output, output_size, "%s/%s", save_root, name ? name + 1 : relative);
     } else {
@@ -426,6 +431,7 @@ static void drastic_resource_path(const char *virtual_path, const char *mode,
     return;
 
   if (!strcmp(relative, "usrcheat.dat") ||
+      !strcmp(relative, "cheats/usrcheat.dat") ||
       !strcmp(relative, "system/usrcheat.dat")) {
     const char *configured = prefs_get_string("Wrapper/CheatPath", "");
     const char *extension = configured[0] ? strrchr(configured, '.') : NULL;

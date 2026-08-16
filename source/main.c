@@ -598,7 +598,7 @@ static void debug_log_all_nds_mappings(void) {
     "nds.hotkey.quickload.pad", "nds.hotkey.next_slot.pad",
     "nds.hotkey.previous_slot.pad", "nds.hotkey.reset.pad",
     "nds.hotkey.quit.pad", "nds.hotkey.swap_screens.pad",
-    "nds.hotkey.mic_blow.pad", "nds.hotkey.lid.pad",
+    "nds.hotkey.lid.pad", "nds.hotkey.mic_input.pad",
     "nds.hotkey.motion_recenter.pad", "nds.hotkey.pointer_click.pad",
     "nds.hotkey.pointer_mode.pad", "nds.hotkey.pause.pad",
     "nds.hotkey.screenshot.pad", "nds.hotkey.mute.pad",
@@ -703,7 +703,8 @@ typedef struct {
   u64 menu;
   u64 fast_forward;
   u64 swap_screens;
-  u64 microphone;
+  u64 pointer_mode;
+  u64 microphone_blow;
   u64 motion_stylus_recenter;
   u64 autofire;
   u64 lid;
@@ -721,7 +722,9 @@ typedef struct {
   int fast_forward;
   int fast_forward_latched;
   int fast_forward_toggle;
-  int microphone_feed;
+  int pointer_mode_enabled;
+  int microphone_blow_active;
+  DrasticStylusMode pointer_stylus_mode;
   int hinge_closed;
   int exit_requested;
   int state_slot;
@@ -757,7 +760,8 @@ static void remove_duplicate_hotkeys(RuntimeHotkeys *hotkeys) {
     &hotkeys->menu,
     &hotkeys->fast_forward,
     &hotkeys->swap_screens,
-    &hotkeys->microphone,
+    &hotkeys->pointer_mode,
+    &hotkeys->microphone_blow,
     &hotkeys->motion_stylus_recenter,
     &hotkeys->autofire,
     &hotkeys->lid,
@@ -810,9 +814,21 @@ static void update_runtime_hud(RuntimeHud *hud,
   overlay_draw_hud(config->show_fps, hud->fps, controls->fast_forward);
 }
 
+static void set_microphone_blow(RuntimeControls *controls, void *clazz,
+                                int enabled) {
+  enabled = enabled != 0;
+  if (controls->microphone_blow_active == enabled) return;
+  controls->microphone_blow_active = enabled;
+  core.setWhitenoiseFeed(fake_env, clazz, enabled);
+  debug_logf("input simulated microphone=%s", enabled ? "enabled" : "disabled");
+}
+
 static void update_frame_sync_monitor(RuntimeFrameSyncMonitor *monitor,
-                                      int frame_ready,
-                                      int fast_forward) {
+                                       int frame_ready,
+                                       int fast_forward) {
+  /* This is an opt-in diagnostic only.  It is intentionally absent from the
+   * ordinary debug log because it floods the file once per second. */
+  if (!prefs_get_bool("Wrapper/FrameSyncLog", false)) return;
   PthrFrameSyncStats current;
   pthr_get_frame_sync_stats(&current);
   const u64 now = armGetSystemTick();
@@ -877,11 +893,13 @@ static void update_frame_sync_monitor(RuntimeFrameSyncMonitor *monitor,
   monitor->present_gap_count = 0;
 }
 
-static void load_runtime_controls(RuntimeControls *controls) {
+static void load_runtime_controls(RuntimeControls *controls,
+                                  DrasticRuntimeConfig *config) {
   controls->hotkeys.menu = launcher_mapping_combo("nds.hotkey.menu.pad");
   controls->hotkeys.fast_forward = launcher_mapping_combo("nds.handle.fastforward");
   controls->hotkeys.swap_screens = launcher_mapping_combo("nds.hotkey.swap_screens.pad");
-  controls->hotkeys.microphone = launcher_mapping_combo("nds.hotkey.mic_blow.pad");
+  controls->hotkeys.pointer_mode = launcher_mapping_combo("nds.hotkey.pointer_mode.pad");
+  controls->hotkeys.microphone_blow = launcher_mapping_combo("nds.hotkey.mic_input.pad");
   controls->hotkeys.motion_stylus_recenter = launcher_mapping_combo("nds.hotkey.motion_recenter.pad");
   controls->hotkeys.autofire = launcher_mapping_combo("nds.handle.autofire");
   controls->hotkeys.lid = launcher_mapping_combo("nds.hotkey.lid.pad");
@@ -897,6 +915,15 @@ static void load_runtime_controls(RuntimeControls *controls) {
   remove_duplicate_hotkeys(&controls->hotkeys);
   controls->fast_forward_toggle = launcher_mapping_is("fastforward.mode", "toggle");
   controls->analog_touch_button = launcher_mapping_combo("nds.hotkey.pointer_click.pad");
+  /* The launcher mapping owns the virtual-pointer state.  Do not inherit
+   * DraStic's old Wrapper/StylusMode preference as an enabled state: doing so
+   * makes the right stick active before nds.hotkey.pointer_mode.pad has ever
+   * been pressed.  Preserve its stick/motion choice for the first toggle, but
+   * always start each launched game with the virtual pointer disabled. */
+  controls->pointer_stylus_mode = config->stylus_mode == DRASTIC_STYLUS_OFF
+      ? DRASTIC_STYLUS_STICK : config->stylus_mode;
+  controls->pointer_mode_enabled = 0;
+  config->stylus_mode = DRASTIC_STYLUS_OFF;
   controls->stylus_speed = prefs_get_int("Wrapper/AnalogStylusSpeed", 8);
   if (controls->stylus_speed < 1) controls->stylus_speed = 1;
   if (controls->stylus_speed > 20) controls->stylus_speed = 20;
@@ -946,8 +973,10 @@ static void configure_input_sampler(DrasticInputSamplerConfig *config,
       controls->hotkeys.fast_forward;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_SWAP_SCREENS] =
       controls->hotkeys.swap_screens;
-  config->hotkeys[DRASTIC_INPUT_HOTKEY_MICROPHONE] =
-      controls->hotkeys.microphone;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_POINTER_MODE] =
+      controls->hotkeys.pointer_mode;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_MICROPHONE_BLOW] =
+      controls->hotkeys.microphone_blow;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_MOTION_STYLUS_RECENTER] =
       controls->hotkeys.motion_stylus_recenter;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_AUTOFIRE] = controls->hotkeys.autofire;
@@ -981,6 +1010,11 @@ static int process_input(DrasticRuntimeConfig *config,
   config->stylus_y = input.stylus_y;
   config->stylus_visible = input.stylus_visible;
 
+  set_microphone_blow(
+      controls, clazz,
+      config->microphone_enabled &&
+          combo_held(held, controls->hotkeys.microphone_blow));
+
   if (menu && (pressed & DRASTIC_INPUT_HOTKEY_BIT(
                             DRASTIC_INPUT_HOTKEY_MENU))) {
     debug_logf("input menu request accepted");
@@ -991,8 +1025,10 @@ static int process_input(DrasticRuntimeConfig *config,
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
                     DRASTIC_INPUT_HOTKEY_SAVE_STATE)) {
     core.pauseSystem(fake_env, clazz, 1);
-    core.saveState(fake_env, clazz, controls->state_slot, 1);
+    const DrasticJBoolean saved = core.saveState(fake_env, clazz,
+                                                  controls->state_slot, 1);
     core.pauseSystem(fake_env, clazz, 0);
+    if (saved) drastic_menu_note_state_save(menu, controls->state_slot);
   }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
                     DRASTIC_INPUT_HOTKEY_LOAD_STATE)) {
@@ -1012,6 +1048,21 @@ static int process_input(DrasticRuntimeConfig *config,
   }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_QUIT))
     controls->exit_requested = 1;
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_POINTER_MODE)) {
+    controls->pointer_mode_enabled ^= 1;
+    config->stylus_mode = controls->pointer_mode_enabled
+        ? controls->pointer_stylus_mode : DRASTIC_STYLUS_OFF;
+    debug_logf("input pointer mode=%s", controls->pointer_mode_enabled
+               ? "enabled" : "disabled");
+  }
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_SWAP_SCREENS)) {
+    config->swap_screens ^= 1;
+    drastic_config_calculate_layout(config, panel_width, panel_height);
+    debug_logf("input screen order=%s", config->swap_screens
+               ? "swapped" : "normal");
+  }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_SCREENSHOT)) {
     char screenshot_path[1200];
     snprintf(screenshot_path, sizeof(screenshot_path),
@@ -1035,14 +1086,6 @@ static int process_input(DrasticRuntimeConfig *config,
     uint64_t packed = config->core_config;
     if (fast_forward) packed |= UINT64_C(1) << 29;
     core.applyConfig(fake_env, clazz, (jlong)packed);
-  }
-  const int microphone_feed =
-      config->microphone_enabled &&
-      config->microphone_source == DRASTIC_MICROPHONE_SIMULATED &&
-      combo_held(held, controls->hotkeys.microphone);
-  if (microphone_feed != controls->microphone_feed) {
-    controls->microphone_feed = microphone_feed;
-    core.setWhitenoiseFeed(fake_env, clazz, microphone_feed != 0);
   }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_LID)) {
     controls->hinge_closed ^= 1;
@@ -1113,6 +1156,7 @@ typedef struct {
 static void suspend_emulation(AppletLifecycle *lifecycle) {
   if (!lifecycle || lifecycle->suspended) return;
   lifecycle->suspended = 1;
+  set_microphone_blow(lifecycle->controls, lifecycle->clazz, 0);
   drastic_input_sampler_update_runtime(
       lifecycle->input_sampler, lifecycle->runtime, false);
   lifecycle->resume_core =
@@ -1195,9 +1239,12 @@ int main(int argc, char *argv[]) {
   if (!make_directory_tree(runtime.save_path))
     fatal_error("Could not create the game save directory:\n%s",
                 runtime.save_path);
-  debug_logf("stage=config-loaded rom=%s core=%s save_path=%s raw_sav=1",
+  debug_logf("stage=config-loaded rom=%s core=%s save_path=%s raw_sav=1 ff_index=%d hires3d=%d cheats=%d",
              runtime.rom_path, runtime.core_path,
-             runtime.save_path[0] ? runtime.save_path : "(default)");
+             runtime.save_path[0] ? runtime.save_path : "(default)",
+             prefs_get_int("Drastic/FastForwardSpeed", 5),
+             1,
+             prefs_get_bool("Drastic/CheatsEnabled", true));
   opensles_set_microphone_enabled(runtime.microphone_enabled != 0);
   opensles_set_microphone_source(
       runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
@@ -1303,7 +1350,9 @@ int main(int argc, char *argv[]) {
   };
   if (controls.state_slot < 0 || controls.state_slot > 9)
     controls.state_slot = 0;
-  load_runtime_controls(&controls);
+  load_runtime_controls(&controls, &runtime);
+  /* The core may retain its previous recorder state during a relaunch. */
+  core.setWhitenoiseFeed(fake_env, clazz, 0);
 
   DrasticMenuCore menu_core = {
     .env = fake_env,
@@ -1402,6 +1451,7 @@ int main(int argc, char *argv[]) {
       reset_runtime_fps_window(&hud);
       controls.fast_forward = -1;
     }
+    drastic_menu_poll(menu);
     if (drastic_menu_is_open(menu)) {
       reset_runtime_fps_window(&hud);
       drastic_input_sampler_update_runtime(input_sampler, &runtime, false);
@@ -1489,6 +1539,7 @@ int main(int argc, char *argv[]) {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleep);
   }
   if (cpu_boost_active) cpu_boost(0);
+  set_microphone_blow(&controls, clazz, 0);
   if (boot_frames == 0 &&
       __atomic_load_n(&game.finished, __ATOMIC_ACQUIRE) && !game.result)
     fatal_error("Drastic could not start:\n%s", runtime.rom_path);
@@ -1500,25 +1551,37 @@ int main(int argc, char *argv[]) {
   if (session_frequency)
     game_play_time += (int)(session_ticks / session_frequency);
   (void)gamedb_session_finished(runtime.rom_path, game_play_count,
-                                game_play_time,
-                                runtime.save_path[0] ? runtime.save_path : SCREENSHOTS_DIR);
+                                 game_play_time,
+                                 runtime.save_path[0] ? runtime.save_path : SCREENSHOTS_DIR);
 
+  debug_logf("shutdown stage=input-sampler-begin");
   drastic_input_sampler_destroy(input_sampler);
+  debug_logf("shutdown stage=input-sampler-done");
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
   drastic_menu_destroy(menu);
+  debug_logf("shutdown stage=core-begin");
   shutdown_core(clazz, &game);
+  debug_logf("shutdown stage=core-done");
   /* Stop DraStic-owned Android service workers while their code and any EGL
    * ownership they hold are still valid. hbloader reuses this process for the
    * launcher, so no libdrastic thread may survive the upcoming renderer/SO
    * teardown. */
+  debug_logf("shutdown stage=core-workers-begin");
   pthr_shutdown();
+  debug_logf("shutdown stage=core-workers-done");
+  debug_logf("shutdown stage=audio-begin");
   opensles_shutdown();
+  debug_logf("shutdown stage=audio-done");
+  debug_logf("shutdown stage=vulkan-begin");
   drastic_renderer_shutdown();
+  debug_logf("shutdown stage=vulkan-done");
+  debug_logf("shutdown stage=finalizers-begin");
   libc_finalize_core();
   pthr_finalize();
   libc_memory_shutdown();
   so_unload(&emu_mod);
+  debug_logf("shutdown stage=return-launcher");
   configure_return_to_launcher(&launch);
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);

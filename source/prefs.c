@@ -118,7 +118,6 @@ static void import_launcher_core_config(void) {
     {"core.drastic.screen_gap", "Wrapper/ScreenGap"},
     {"core.drastic.integer_scale", "Wrapper/IntegerScale"},
     {"core.drastic.video_filter", "Wrapper/VideoFilter"},
-    {"core.drastic.swap_screens", "Wrapper/SwapScreens"},
     {"core.drastic.volume", "Wrapper/Volume"},
     {"core.drastic.microphone_source", "Wrapper/MicrophoneSource"},
     {"core.drastic.vibration", "Wrapper/Vibration"},
@@ -212,7 +211,6 @@ static void seed_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
   seed("Drastic/RomPath", pending_rom[0] ? pending_rom : "");
   seed("Wrapper/Layout", "horizontal");
-  seed("Wrapper/SwapScreens", "false");
   seed("Wrapper/Rotation", "0");
   seed("Wrapper/ScreenGap", "8");
   seed("Wrapper/IntegerScale", "false");
@@ -312,11 +310,22 @@ void prefs_init(const char *path) {
   /* LSFG is a Vulkan-only runtime option.  Preserve its user settings so the
    * renderer can reserve its device/swapchain resources at the next launch. */
   prefs_remove("Wrapper/LSFGDllPath");
+  /* Screen order is a runtime-only action controlled by the launcher's NDS
+   * mapping. Older per-core toggles must not reactivate it at next launch. */
+  prefs_remove("Wrapper/SwapScreens");
   migrate_stylus_mode();
   seed_defaults();
   migrate_fast_forward_speed();
   import_launcher_core_config();
   import_game_launch_profile();
+  /* Older launcher builds materialized their UI fallback of 200% into
+   * config.cfg.  It is not an explicit user choice, so migrate that legacy
+   * default after every import; other selected rates remain untouched. */
+  if (prefs_get_int("Drastic/FastForwardSpeed", 5) == 2)
+    put_entry("Drastic/FastForwardSpeed", "5");
+  /* This Vulkan host always runs DraStic's 3D engine at 2x.  The core has no
+   * higher multiplier and this intentionally overrides stale launcher data. */
+  put_entry("Drastic/Hires3D", "true");
   /* The shared NDS save directory is also consumed by nds_stub.  DraStic's
    * native .dsv format appends a DeSmuME footer and cannot safely share that
    * file, so always request its raw, interoperable .sav output.  Do this

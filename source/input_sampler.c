@@ -404,7 +404,7 @@ static void *input_thread_main(void *opaque) {
     const int virtual_touch = runtime.gameplay_enabled &&
         runtime.stylus_mode != DRASTIC_STYLUS_OFF &&
         sampler->config.analog_touch_button &&
-        (held & sampler->config.analog_touch_button) &&
+        combo_held(held, sampler->config.analog_touch_button) &&
         !(runtime.stylus_mode == DRASTIC_STYLUS_MOTION &&
           combo_held(held, sampler->config.hotkeys[
               DRASTIC_INPUT_HOTKEY_MOTION_STYLUS_RECENTER]));

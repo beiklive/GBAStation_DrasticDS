@@ -259,6 +259,62 @@ const char *fix_path(const char *path) {
 
   if (!path)
     return path;
+  /* The core's cheat database is opened through native POSIX on some builds,
+   * bypassing DraSticPathCache.  It may use an Android absolute path, a
+   * virtual root, or a filename relative to its data directory; map every
+   * usrcheat.dat request to the launcher-selected database before applying
+   * the generic Android-directory translation below. */
+  const char *base_name = strrchr(path, '/');
+  base_name = base_name ? base_name + 1 : path;
+  if (!strcasecmp(base_name, "usrcheat.dat")) {
+    char *out = buf[which];
+    which ^= 1;
+    const char *configured = prefs_get_string("Wrapper/CheatPath", "");
+    const char *extension = configured[0] ? strrchr(configured, '.') : NULL;
+    if (configured[0] && extension && !strcasecmp(extension, ".dat"))
+      snprintf(out, sizeof(buf[0]), "%s", configured);
+    else if (configured[0])
+      snprintf(out, sizeof(buf[0]), "%s/usrcheat.dat", configured);
+    else
+      snprintf(out, sizeof(buf[0]), "%s", CHEAT_DATABASE_PATH);
+    return out;
+  }
+
+  /* A few native paths have already been expanded by the Java facade before
+   * they arrive at POSIX.  They no longer begin with DraStic/ or User/, so the
+   * virtual-root handling below cannot see them.  Recognize the host's two
+   * historical absolute spellings as well and preserve only the filename in
+   * the GameDB-owned persistence directory. */
+  static const char *const expanded_roots[] = {
+    USER_DIR,
+    "/GBAStation/drastic/user",
+    "sdmc:/GBAStation/drastic/user",
+    DATA_ROOT,
+    "/GBAStation/drastic",
+    "sdmc:/GBAStation/drastic",
+  };
+  const char *save_root = prefs_get_string("Wrapper/SavePath", "");
+  if (save_root[0]) {
+    for (unsigned index = 0;
+         index < sizeof(expanded_roots) / sizeof(*expanded_roots); index++) {
+      const char *root = expanded_roots[index];
+      const size_t root_length = strlen(root);
+      if (strncmp(path, root, root_length) || path[root_length] != '/')
+        continue;
+      const char *relative = path + root_length + 1;
+      if (strncmp(relative, "backup/", 7) &&
+          strncmp(relative, "saves/", 6) &&
+          strncmp(relative, "battery/", 8) &&
+          strncmp(relative, "savestates/", 11))
+        continue;
+      char *out = buf[which];
+      which ^= 1;
+      const char *name = strrchr(relative, '/');
+      snprintf(out, sizeof(buf[0]), "%s/%s", save_root,
+               name ? name + 1 : relative);
+      return out;
+    }
+  }
   /* Match the JNI path cache: the core uses both DraStic/foo and
    * /DraStic/foo depending on the call site. */
   if (!strncmp(path, "/DraStic/", 9) || !strncmp(path, "/User/", 6))
@@ -268,19 +324,24 @@ const char *fix_path(const char *path) {
   if (!strncmp(path, "DraStic/", 8) || !strncmp(path, "User/", 5)) {
     const int drastic_root = !strncmp(path, "DraStic/", 8);
     const char *rest = path + (drastic_root ? 8 : 5);
+    const char *persistence = drastic_root && !strncmp(rest, "user/", 5)
+        ? rest + 5 : rest;
     const char *root = drastic_root ? DATA_ROOT : USER_DIR;
     char *out = buf[which];
     which ^= 1;
     const char *save_root = prefs_get_string("Wrapper/SavePath", "");
     if (save_root[0] &&
-        ((drastic_root && (!strncmp(rest, "backup/", 7) ||
-                            !strncmp(rest, "saves/", 6) ||
-                            !strncmp(rest, "battery/", 8) ||
-                            !strncmp(rest, "savestates/", 11))) ||
-         (!drastic_root && !strncmp(rest, "savestates/", 11)))) {
-      const char *name = strrchr(rest, '/');
+        ((drastic_root && (!strncmp(persistence, "backup/", 7) ||
+                             !strncmp(persistence, "saves/", 6) ||
+                             !strncmp(persistence, "battery/", 8) ||
+                             !strncmp(persistence, "savestates/", 11))) ||
+          (!drastic_root && (!strncmp(persistence, "backup/", 7) ||
+                             !strncmp(persistence, "saves/", 6) ||
+                             !strncmp(persistence, "battery/", 8) ||
+                             !strncmp(persistence, "savestates/", 11))))) {
+      const char *name = strrchr(persistence, '/');
       snprintf(out, sizeof(buf[0]), "%s/%s", save_root,
-               name ? name + 1 : rest);
+               name ? name + 1 : persistence);
     } else {
       snprintf(out, sizeof(buf[0]), "%s/%s", root, rest);
     }
