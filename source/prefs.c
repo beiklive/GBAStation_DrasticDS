@@ -73,7 +73,7 @@ static void parse_file(const char *path) {
 
 static void seed_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
-  seed("Drastic/RomPath", pending_rom[0] ? pending_rom : DEFAULT_ROM_PATH);
+  seed("Drastic/RomPath", pending_rom[0] ? pending_rom : "");
   seed("Wrapper/Layout", "horizontal");
   seed("Wrapper/SwapScreens", "false");
   seed("Wrapper/Rotation", "0");
@@ -86,24 +86,10 @@ static void seed_defaults(void) {
   seed("Wrapper/MicrophoneSource", "noise");
   seed("Wrapper/Vibration", "true");
   seed("Wrapper/Motion", "true");
-  seed("Wrapper/AnalogDpad", "true");
-  seed("Wrapper/AnalogDeadzone", "35");
   seed("Wrapper/StylusMode", "stick");
   seed("Wrapper/MouseStylus", "true");
-  seed("Wrapper/AnalogTouchButton", "StickR");
   seed("Wrapper/AnalogStylusSpeed", "8");
   seed("Wrapper/MotionStylusSensitivity", "10");
-  seed("Wrapper/HotkeyMotionStylusRecenter", "L+R+StickR");
-  seed("Wrapper/HotkeyFastForward", "ZR");
-  seed("Wrapper/HotkeyMenu", "L+R+Plus");
-  seed("Wrapper/HotkeySwapScreens", "ZL");
-  seed("Wrapper/HotkeyMicrophone", "StickL");
-  seed("Wrapper/HotkeySaveState", "L+R+Minus+Y");
-  seed("Wrapper/HotkeyLoadState", "L+R+Minus+X");
-  seed("Wrapper/HotkeyNextSlot", "L+R+Minus+Up");
-  seed("Wrapper/HotkeyPreviousSlot", "L+R+Minus+Down");
-  seed("Wrapper/HotkeyReset", "L+R+Minus+A");
-  seed("Wrapper/HotkeyQuit", "None");
   seed("Wrapper/StateSlot", "0");
   seed("Wrapper/CustomTopX", "0.30");
   seed("Wrapper/CustomTopY", "0.04");
@@ -113,19 +99,6 @@ static void seed_defaults(void) {
   seed("Wrapper/CustomBottomY", "0.56");
   seed("Wrapper/CustomBottomW", "0.40");
   seed("Wrapper/CustomBottomH", "0.40");
-
-  seed("Wrapper/Pad/A", "A");
-  seed("Wrapper/Pad/B", "B");
-  seed("Wrapper/Pad/X", "X");
-  seed("Wrapper/Pad/Y", "Y");
-  seed("Wrapper/Pad/L", "L");
-  seed("Wrapper/Pad/R", "R");
-  seed("Wrapper/Pad/Start", "Plus");
-  seed("Wrapper/Pad/Select", "Minus");
-  seed("Wrapper/Pad/Up", "Up");
-  seed("Wrapper/Pad/Down", "Down");
-  seed("Wrapper/Pad/Left", "Left");
-  seed("Wrapper/Pad/Right", "Right");
 
   seed("Drastic/FrameskipValue", "0");
   seed("Drastic/FrameskipType", "0");
@@ -163,42 +136,6 @@ static void seed_defaults(void) {
   seed("Drastic/FirmwareBirthdayDay", "6");
 }
 
-static void migrate_hotkey_defaults(void) {
-  const int version_index = find_entry("Wrapper/HotkeyDefaultsVersion");
-  const int version = version_index < 0 ? 0 : atoi(entries[version_index].value);
-  if (version >= 3) return;
-
-  const int menu_index = find_entry("Wrapper/HotkeyMenu");
-  const int quit_index = find_entry("Wrapper/HotkeyQuit");
-  if (version < 2 && menu_index >= 0 && quit_index >= 0 &&
-      !strcasecmp(entries[menu_index].value, "L+R+Minus") &&
-      !strcasecmp(entries[quit_index].value, "L+R+Plus")) {
-    put_entry("Wrapper/HotkeyMenu", "L+R+Plus");
-    put_entry("Wrapper/HotkeyQuit", "None");
-  }
-  struct HotkeyDefault {
-    const char *key;
-    const char *old_value;
-    const char *new_value;
-  };
-  static const struct HotkeyDefault safer_defaults[] = {
-    {"Wrapper/HotkeySaveState", "L+R+Y", "L+R+Minus+Y"},
-    {"Wrapper/HotkeyLoadState", "L+R+X", "L+R+Minus+X"},
-    {"Wrapper/HotkeyNextSlot", "L+R+Up", "L+R+Minus+Up"},
-    {"Wrapper/HotkeyPreviousSlot", "L+R+Down", "L+R+Minus+Down"},
-    {"Wrapper/HotkeyReset", "L+R+A", "L+R+Minus+A"},
-  };
-  for (unsigned index = 0;
-       index < sizeof(safer_defaults) / sizeof(*safer_defaults); index++) {
-    const int entry_index = find_entry(safer_defaults[index].key);
-    if (entry_index >= 0 &&
-        !strcasecmp(entries[entry_index].value,
-                    safer_defaults[index].old_value))
-      put_entry(safer_defaults[index].key, safer_defaults[index].new_value);
-  }
-  put_entry("Wrapper/HotkeyDefaultsVersion", "3");
-}
-
 static void migrate_fast_forward_speed(void) {
   const int version = prefs_get_int("Wrapper/LauncherSettingsVersion", 0);
   if (version >= 3) return;
@@ -225,6 +162,10 @@ void prefs_init(const char *path) {
   entry_count = 0;
   snprintf(ini_path, sizeof(ini_path), "%s", path ? path : PREFS_PATH);
   parse_file(ini_path);
+  /* The launcher ROM is an invocation-scoped override.  Loading drastic.ini
+   * first used to retain its previous Drastic/RomPath because seed_defaults()
+   * only fills missing keys, so every launch reopened the old game. */
+  if (pending_rom[0]) put_entry("Drastic/RomPath", pending_rom);
   prefs_remove("Wrapper/CpuBoost");
   prefs_remove("Wrapper/Renderer");
   prefs_remove("Wrapper/VulkanLowLatency");
@@ -234,7 +175,6 @@ void prefs_init(const char *path) {
   prefs_remove("Wrapper/LSFGDllPath");
   migrate_stylus_mode();
   seed_defaults();
-  migrate_hotkey_defaults();
   migrate_fast_forward_speed();
 }
 

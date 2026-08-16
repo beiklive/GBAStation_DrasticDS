@@ -147,9 +147,10 @@ static float clamp_float(float value, float minimum, float maximum) {
 
 void drastic_config_load(DrasticRuntimeConfig *config) {
   memset(config, 0, sizeof(*config));
-  /* Current standalone-host test target.  The launcher is intentionally not
-   * part of this build, so do not inherit a stale per-game ROM path. */
-  snprintf(config->rom_path, sizeof(config->rom_path), "%s", DEFAULT_ROM_PATH);
+  /* The GBAStation launcher supplies the active ROM before preferences are
+   * initialized. Never reuse a previous game's path as a fallback. */
+  snprintf(config->rom_path, sizeof(config->rom_path), "%s",
+           prefs_get_string("Drastic/RomPath", ""));
   snprintf(config->core_path, sizeof(config->core_path), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
   snprintf(config->firmware_nickname, sizeof(config->firmware_nickname), "%s",
@@ -172,6 +173,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->rotation = clamp_int(prefs_get_int("Wrapper/Rotation", 0), 0, 3);
   config->screen_gap = clamp_int(prefs_get_int("Wrapper/ScreenGap", 8), 0, 128);
   config->integer_scale = prefs_get_bool("Wrapper/IntegerScale", false);
+  config->vulkan_low_latency =
+      prefs_get_bool("Wrapper/VulkanLowLatency", false);
   config->video_filter = read_filter();
   snprintf(config->custom_shader, sizeof(config->custom_shader), "%s",
            prefs_get_string("Wrapper/CustomShader", ""));

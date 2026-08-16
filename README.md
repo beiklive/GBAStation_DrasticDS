@@ -1,16 +1,26 @@
-# Drastic DS — standalone OpenGL test host
+# Drastic DS — standalone Vulkan host
 
-This project builds one Nintendo Switch NRO, `GBAStationDrasticStub.nro`.  It has no
-launcher, Vulkan renderer, switchVK SDK, SMB support, or USB mass-storage
-support.  The NRO starts the OpenGL DraStic host directly.
+This project builds one Nintendo Switch NRO, `GBAStationNDSStub.nro`. It is
+a Vulkan/NVK DraStic host launched by GBAStation. It has no internal game
+browser, SMB support, USB mass-storage support, or automatic resource
+extraction.
 
 ## Current test paths
 
-The host currently launches one fixed ROM:
+The GBAStation launcher supplies the ROM path when it launches this host:
 
 ```text
-sdmc:/nds/black.nds
+GBAStationNDSStub.nro <rom-path> --return <launcher.nro>
 ```
+
+`--return` defaults to `sdmc:/switch/GBAStation.nro`; pass `--exit-to-home` to
+leave to Homebrew Menu instead. On normal emulator exit the host schedules the
+return NRO with `envSetNextLoad`.
+
+Game buttons and hotkeys are read only from the same launcher configuration
+used by `nds_stub`: `sdmc:/GBAStation/config/config.cfg`. The host accepts typed
+records such as `nds.handle.a=s|PAD_A` and `nds.hotkey.menu.pad=s|PAD_LT+PAD_RT`.
+There are no fallback host bindings: omitted mapping keys remain unbound.
 
 Place the required user-supplied files on the SD card as follows:
 
@@ -33,11 +43,12 @@ services and sufficient application memory.
 
 ## Build
 
-Install the devkitPro Switch OpenGL dependencies:
+Install the devkitPro Switch build dependencies, and keep the switchVK SDK at
+the sibling path `../switchVK/nvk-switch-26.1.4` (or set `NVK_SDK_DIR`):
 
 ```sh
-pacman -S devkitA64 switch-tools libnx switch-mesa switch-libdrm_nouveau \
-          switch-zlib python mingw-w64-ucrt-x86_64-glslang
+pacman -S devkitA64 switch-tools libnx switch-zlib python \
+          mingw-w64-ucrt-x86_64-glslang
 ```
 
 Copy legal DraStic shader assets under
@@ -47,10 +58,11 @@ Copy legal DraStic shader assets under
 bash ./build_local.sh -j 4
 ```
 
-The output is `GBAStationDrasticStub.nro` in this directory.
+The output is `GBAStationNDSStub.nro` in this directory.
 
 ## Remaining scope
 
-This is an OpenGL-only test target. It does not include a game browser,
-per-game renderer selection, USB/SMB libraries, automatic resource extraction,
-or a graphical launcher.
+This is a Vulkan-only target using switchVK's loaderless NVK ICD. The build
+generates a small Vulkan dispatch layer, the DraStic post-processing SPIR-V,
+and the main composite SPIR-V. It does not include a game browser, OpenGL
+fallback, USB/SMB libraries, automatic resource extraction, or a launcher.

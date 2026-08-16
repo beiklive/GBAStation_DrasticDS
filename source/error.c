@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "util.h"
+#include "debug_log.h"
 #include "error.h"
 
 static int g_graphics_active;
@@ -28,6 +29,7 @@ void fatal_error(const char *fmt, ...) {
   va_start(list, fmt);
   vsnprintf(msg, sizeof(msg), fmt, list);
   va_end(list);
+  debug_logf("fatal_error: %s", msg);
 
   /* consoleInit reclaims VI/framebuffer state and cannot safely run after the
    * Vulkan or EGL renderer owns the display. Return directly to hbmenu

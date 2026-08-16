@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <freetype2/ft2build.h>
+#include FT_FREETYPE_H
+
 #include "overlay.h"
 
 static uint32_t g_pixels[DRASTIC_OVERLAY_PIXELS];
@@ -15,6 +18,9 @@ static DrasticOverlayFrame g_frame = {
 };
 static ConsoleFont g_font;
 static int g_font_ready;
+static FT_Library g_freetype;
+static FT_Face g_chinese_font;
+static int g_chinese_font_attempted;
 static uint64_t g_hud_generation = UINT64_MAX;
 static int g_hud_show_fps = -1;
 static int g_hud_fps_tenth = -2;
@@ -26,6 +32,24 @@ static int clamp_int(int value, int minimum, int maximum) {
   return value;
 }
 
+static void overlay_init_chinese_font(void) {
+  if (g_chinese_font_attempted) return;
+  g_chinese_font_attempted = 1;
+  if (R_FAILED(plInitialize(PlServiceType_User))) return;
+
+  PlFontData font_data;
+  if (R_FAILED(plGetSharedFontByType(&font_data,
+                                     PlSharedFontType_ChineseSimplified)) ||
+      !font_data.address || !font_data.size)
+    return;
+  if (FT_Init_FreeType(&g_freetype) != 0) return;
+  if (FT_New_Memory_Face(g_freetype, (const FT_Byte *)font_data.address,
+                         (FT_Long)font_data.size, 0, &g_chinese_font) != 0) {
+    FT_Done_FreeType(g_freetype);
+    g_freetype = NULL;
+  }
+}
+
 void overlay_init(int rotation) {
   PrintConsole *console = consoleGetDefault();
   if (console && console->font.gfx && console->font.tileWidth &&
@@ -33,6 +57,7 @@ void overlay_init(int rotation) {
     g_font = console->font;
     g_font_ready = 1;
   }
+  overlay_init_chinese_font();
   g_frame.width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
                                  : DRASTIC_OVERLAY_WIDTH;
   g_frame.height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
@@ -202,8 +227,8 @@ static int glyph_set(unsigned character, int source_x, int source_y) {
   return (row[stored_bit / 8] & (uint8_t)(1u << (stored_bit & 7))) != 0;
 }
 
-static void draw_character(int x, int y, int scale, uint32_t color,
-                           unsigned character) {
+static void draw_ascii_character(int x, int y, int scale, uint32_t color,
+                                 unsigned character) {
   if (!g_font_ready || scale <= 0) return;
   if (character > 255) character = '?';
   for (int source_y = 0; source_y < g_font.tileHeight; source_y++) {
@@ -215,24 +240,92 @@ static void draw_character(int x, int y, int scale, uint32_t color,
   }
 }
 
+static uint32_t color_with_alpha(uint32_t color, unsigned alpha) {
+  const unsigned base_alpha = color >> 24;
+  return (color & 0x00ffffffu) |
+      ((uint32_t)((base_alpha * alpha + 127) / 255) << 24);
+}
+
+static int overlay_decode_utf8(const unsigned char **cursor) {
+  const unsigned char *text = *cursor;
+  if (text[0] < 0x80) {
+    (*cursor)++;
+    return text[0];
+  }
+  int codepoint = 0;
+  int length = 0;
+  if ((text[0] & 0xe0) == 0xc0) {
+    codepoint = text[0] & 0x1f; length = 2;
+  } else if ((text[0] & 0xf0) == 0xe0) {
+    codepoint = text[0] & 0x0f; length = 3;
+  } else if ((text[0] & 0xf8) == 0xf0) {
+    codepoint = text[0] & 0x07; length = 4;
+  } else {
+    (*cursor)++;
+    return '?';
+  }
+  for (int index = 1; index < length; index++) {
+    if ((text[index] & 0xc0) != 0x80) {
+      (*cursor)++;
+      return '?';
+    }
+    codepoint = (codepoint << 6) | (text[index] & 0x3f);
+  }
+  *cursor += length;
+  return codepoint;
+}
+
+static int unicode_character_width(unsigned character, int scale) {
+  if (character < 0x80) return g_font.tileWidth * scale;
+  if (!g_chinese_font) return g_font.tileWidth * scale;
+  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, g_font.tileHeight * scale) != 0 ||
+      FT_Load_Char(g_chinese_font, character, FT_LOAD_DEFAULT) != 0)
+    return g_font.tileWidth * scale;
+  int advance = (int)(g_chinese_font->glyph->advance.x >> 6);
+  return advance > 0 ? advance : g_font.tileWidth * scale;
+}
+
+static void draw_unicode_character(int x, int y, int scale, uint32_t color,
+                                   unsigned character) {
+  if (character < 0x80 || !g_chinese_font) {
+    draw_ascii_character(x, y, scale, color, character);
+    return;
+  }
+  if (FT_Set_Pixel_Sizes(g_chinese_font, 0, g_font.tileHeight * scale) != 0 ||
+      FT_Load_Char(g_chinese_font, character, FT_LOAD_RENDER) != 0) {
+    draw_ascii_character(x, y, scale, color, '?');
+    return;
+  }
+
+  const FT_Bitmap *bitmap = &g_chinese_font->glyph->bitmap;
+  const int top = y + g_font.tileHeight * scale - g_chinese_font->glyph->bitmap_top;
+  const int left = x + g_chinese_font->glyph->bitmap_left;
+  for (unsigned row = 0; row < bitmap->rows; row++) {
+    const unsigned char *pixels = bitmap->buffer + row * bitmap->pitch;
+    for (unsigned column = 0; column < bitmap->width; column++) {
+      const unsigned alpha = pixels[column];
+      if (alpha)
+        overlay_fill_rect(left + (int)column, top + (int)row, 1, 1,
+                          color_with_alpha(color, alpha));
+    }
+  }
+}
+
 void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
                               const char *text) {
   if (!text || !g_font_ready || scale <= 0) return;
   const int origin = x;
-  for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
-       cursor++) {
+  const unsigned char *cursor = (const unsigned char *)text;
+  while (*cursor) {
     if (*cursor == '\n') {
+      cursor++;
       x = origin;
       y += g_font.tileHeight * scale;
       continue;
     }
-    unsigned character = *cursor;
-    if (character >= 0x80) {
-      character = '?';
-      while ((cursor[1] & 0xc0) == 0x80) cursor++;
-    }
-    draw_character(x, y, scale, color, character);
-    x += g_font.tileWidth * scale;
+    const unsigned character = (unsigned)overlay_decode_utf8(&cursor);
+    draw_unicode_character(x, y, scale, color, character);
+    x += unicode_character_width(character, scale);
   }
 }
 
@@ -243,25 +336,39 @@ void overlay_draw_text(int x, int y, uint32_t color, const char *text) {
 void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
                                const char *text) {
   if (!text || max_width <= 0 || !g_font_ready) return;
-  const int cells = max_width / g_font.tileWidth;
-  if (cells <= 0) return;
-  char buffer[192];
-  int used = 0;
+  if (max_width <= 0) return;
+  char buffer[384];
+  int used = 0, width = 0;
   const unsigned char *cursor = (const unsigned char *)text;
-  while (*cursor && used < cells && used < (int)sizeof(buffer) - 1) {
-    if (*cursor < 0x80) {
-      buffer[used++] = (char)*cursor++;
-    } else {
-      buffer[used++] = '?';
-      cursor++;
-      while ((*cursor & 0xc0) == 0x80) cursor++;
+  while (*cursor && used < (int)sizeof(buffer) - 5) {
+    const unsigned char *start = cursor;
+    const unsigned character = (unsigned)overlay_decode_utf8(&cursor);
+    const int character_width = unicode_character_width(character, 1);
+    if (width + character_width > max_width) {
+      cursor = start;
+      break;
     }
+    const int byte_count = (int)(cursor - start);
+    memcpy(buffer + used, start, (size_t)byte_count);
+    used += byte_count;
+    width += character_width;
   }
-  if (*cursor && cells >= 3) {
-    used = cells < (int)sizeof(buffer) ? cells : (int)sizeof(buffer) - 1;
-    buffer[used - 3] = '.';
-    buffer[used - 2] = '.';
-    buffer[used - 1] = '.';
+  if (*cursor && used >= 3) {
+    while (used > 0 && width + g_font.tileWidth * 3 > max_width) {
+      const unsigned char *start = (const unsigned char *)buffer;
+      const unsigned char *last = start;
+      const unsigned char *scan = start;
+      while ((size_t)(scan - start) < (size_t)used) {
+        last = scan;
+        (void)overlay_decode_utf8(&scan);
+      }
+      const unsigned removed = (unsigned)overlay_decode_utf8(&last);
+      width -= unicode_character_width(removed, 1);
+      used = (int)(last - start);
+    }
+    buffer[used++] = '.';
+    buffer[used++] = '.';
+    buffer[used++] = '.';
   }
   buffer[used] = '\0';
   overlay_draw_text(x, y, color, buffer);

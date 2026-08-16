@@ -86,14 +86,16 @@ struct DrasticIngameMenu {
   int editor_screen;
 };
 
-static const uint32_t COLOR_DIM = 0x99000000u;
-static const uint32_t COLOR_PANEL = 0xf218202cu;
-static const uint32_t COLOR_PANEL_ALT = 0xe5263444u;
-static const uint32_t COLOR_ACCENT = 0xff35d3e8u;
-static const uint32_t COLOR_SELECTED = 0xff176f8bu;
-static const uint32_t COLOR_TEXT = 0xfff4f7f9u;
-static const uint32_t COLOR_MUTED = 0xffa6b3c0u;
-static const uint32_t COLOR_GOOD = 0xff65e89au;
+/* Shared with the GBAStation NDS stub: dark blue glass panels, soft borders,
+ * and a bright cyan focus outline. */
+static const uint32_t COLOR_DIM = 0xb60a1019u;
+static const uint32_t COLOR_PANEL = 0xe9162434u;
+static const uint32_t COLOR_PANEL_ALT = 0xd52a4058u;
+static const uint32_t COLOR_ACCENT = 0xff52bfffu;
+static const uint32_t COLOR_SELECTED = 0xd92a6c9eu;
+static const uint32_t COLOR_TEXT = 0xfff6fbffu;
+static const uint32_t COLOR_MUTED = 0xffa9b9c9u;
+static const uint32_t COLOR_GOOD = 0xff66d99au;
 static const uint32_t COLOR_WARN = 0xffffc857u;
 
 static int clamp_int(int value, int minimum, int maximum) {
@@ -168,6 +170,15 @@ static int ui_width(void) { return overlay_width(); }
 static int ui_height(void) { return overlay_height(); }
 
 static int ui_is_portrait(void) { return ui_height() > ui_width(); }
+
+static int menu_sidebar_x(void) { return ui_is_portrait() ? 30 : 48; }
+static int menu_sidebar_width(void) { return ui_is_portrait() ? 250 : 336; }
+static int menu_content_x(void) { return ui_is_portrait() ? 300 : 432; }
+static int menu_content_y(void) { return 110; }
+static int menu_content_width(void) {
+  return ui_width() - menu_content_x() - (ui_is_portrait() ? 36 : 58);
+}
+static int menu_content_height(void) { return ui_height() - 200; }
 
 static void set_status(DrasticIngameMenu *menu, const char *status) {
   snprintf(menu->status, sizeof(menu->status), "%s", status ? status : "");
@@ -376,7 +387,7 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
                               0, MENU_CHEAT_LIMIT);
   if (total) menu->cheats = calloc((size_t)total, sizeof(*menu->cheats));
   if (total && !menu->cheats) {
-    set_status(menu, "Not enough memory to load the cheat list");
+    set_status(menu, "内存不足，无法加载金手指列表");
     return;
   }
   menu->folder_count = menu->core.get_cheat_folder_count
@@ -485,7 +496,7 @@ static int parse_cheat_words(const char *text, int32_t *words, int capacity) {
 
 static void add_custom_cheat(DrasticIngameMenu *menu) {
   if (!menu->core.add_custom_cheat) {
-    set_status(menu, "Custom cheats are unavailable in this core");
+    set_status(menu, "当前核心不支持自定义金手指");
     return;
   }
   char name[96] = {0};
@@ -505,13 +516,13 @@ static void add_custom_cheat(DrasticIngameMenu *menu) {
   const int count = parse_cheat_words(codes, words,
                                       (int)(sizeof(words) / sizeof(*words)));
   if (count < 0) {
-    set_status(menu, "Invalid code: use 8-digit address/value pairs");
+    set_status(menu, "代码无效：请使用 8 位地址/数值对");
     return;
   }
   void *array = jni_make_int_array(count);
   int32_t *data = jni_int_array_data(array);
   if (!data) {
-    set_status(menu, "Could not allocate the cheat code");
+    set_status(menu, "无法分配金手指代码内存");
     return;
   }
   memcpy(data, words, (size_t)count * sizeof(*data));
@@ -523,36 +534,86 @@ static void add_custom_cheat(DrasticIngameMenu *menu) {
   if (menu->core.update_cheats)
     menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
   refresh_cheats(menu);
-  set_status(menu, result ? "Custom cheat added" :
-                            "Drastic rejected the custom cheat");
+  set_status(menu, result ? "已添加自定义金手指" :
+                            "DraStic 拒绝了此自定义金手指");
 }
 
-static void draw_shell(const char *title, const char *help) {
+static int active_main_tab(const DrasticIngameMenu *menu) {
+  switch (menu->page) {
+    case MENU_STATES: return 1;
+    case MENU_CHEATS: return 2;
+    case MENU_DISPLAY: return 3;
+    case MENU_EMULATION: return 4;
+    case MENU_AUDIO_INPUT: return 5;
+    default: return menu->selection[MENU_MAIN];
+  }
+}
+
+static void draw_shell(const DrasticIngameMenu *menu, const char *title,
+                       const char *help) {
+  static const char *tabs[] = {
+    "返回游戏", "即时存档", "金手指", "画面设置",
+    "模拟设置", "音频与输入", "重置游戏", "退出模拟器",
+  };
   const int width = ui_width();
   const int height = ui_height();
   overlay_fill_rect(0, 0, width, height, COLOR_DIM);
-  overlay_fill_rect(0, 0, width, 76, COLOR_PANEL);
-  overlay_fill_rect(0, 74, width, 2, COLOR_ACCENT);
-  overlay_draw_text_scaled(32, 18, 2, COLOR_TEXT, title);
-  overlay_fill_rect(0, height - 50, width, 50, COLOR_PANEL);
-  overlay_draw_text_clipped(28, height - 33, width - 56, COLOR_MUTED, help);
+  for (int band = 0; band < 8; band++)
+    overlay_fill_rect(0, band * height / 8, width, height / 8,
+                      0x0b1b3148u + (uint32_t)(band * 0x03000000u));
+
+  overlay_fill_rect(0, 0, width, 86, 0xef122033u);
+  overlay_fill_rect(0, 84, width, 2, 0x7752bfffu);
+  overlay_draw_text_scaled(menu_sidebar_x(), 22, 2, COLOR_TEXT, "游戏菜单");
+  overlay_draw_text_right(width - 42, 32, COLOR_MUTED, title);
+
+  const int side_x = menu_sidebar_x();
+  const int side_y = 116;
+  const int side_w = menu_sidebar_width();
+  const int active = active_main_tab(menu);
+  overlay_fill_rect(side_x, side_y - 10, side_w, height - side_y - 100,
+                    0x91132132u);
+  overlay_border_rect(side_x, side_y - 10, side_w, height - side_y - 100,
+                      1, 0x443f5d78u);
+  for (int index = 0; index < 8; index++) {
+    const int y = side_y + index * 58 + (index >= 6 ? 16 : 0);
+    if (index == 6)
+      overlay_fill_rect(side_x + 18, y - 9, side_w - 36, 1, 0x5556748du);
+    const int selected = index == active;
+    if (selected) {
+      overlay_fill_rect(side_x + 10, y, side_w - 20, 48, COLOR_SELECTED);
+      overlay_border_rect(side_x + 10, y, side_w - 20, 48, 2, COLOR_ACCENT);
+    } else {
+      overlay_fill_rect(side_x + 10, y, side_w - 20, 48, 0x161b3045u);
+    }
+    overlay_draw_text(side_x + 30, y + 16, selected ? COLOR_TEXT : COLOR_MUTED,
+                      tabs[index]);
+  }
+
+  overlay_fill_rect(menu_content_x(), menu_content_y(), menu_content_width(),
+                    menu_content_height(), 0xa9142234u);
+  overlay_border_rect(menu_content_x(), menu_content_y(), menu_content_width(),
+                      menu_content_height(), 1, 0x554c6f8cu);
+  overlay_fill_rect(0, height - 56, width, 56, 0xe8122030u);
+  overlay_fill_rect(0, height - 56, width, 1, 0x554b7090u);
+  overlay_draw_text_clipped(36, height - 36, width - 72, COLOR_MUTED, help);
 }
 
 static void draw_status(const DrasticIngameMenu *menu) {
   if (!menu->status[0]) return;
   const int width = ui_width();
   const int y = ui_height() - 96;
-  overlay_fill_rect(24, y, width - 48, 36, 0xe5263444u);
+  overlay_fill_rect(24, y, width - 48, 36, 0xe52a4058u);
   overlay_draw_text_clipped(40, y + 10, width - 80,
                             COLOR_WARN, menu->status);
 }
 
 static void draw_row(int x, int y, int width, int selected,
                      const char *label, const char *value, int enabled) {
-  if (selected)
-    overlay_fill_rect(x, y, width, 44, COLOR_SELECTED);
-  else if ((y / 44) & 1)
-    overlay_fill_rect(x, y, width, 44, 0x6622303cu);
+  overlay_fill_rect(x, y, width, 44,
+                    selected ? COLOR_SELECTED : 0x261b3045u);
+  overlay_border_rect(x, y, width, 44, 1,
+                      selected ? COLOR_ACCENT : 0x334c6f8cu);
   overlay_draw_text_clipped(x + 16, y + 14,
                             value ? width - 250 : width - 32,
                             enabled ? COLOR_TEXT : COLOR_MUTED, label);
@@ -589,173 +650,121 @@ static int main_item_available(int item) {
 }
 
 static void render_main(DrasticIngameMenu *menu) {
-  static const char *items[] = {
-    "Resume game", "Save states", "Cheats", "Screen layout & filters",
-    "Emulation options", "Audio, input & motion",
-    "Reset game",
-    "Quit emulator",
-  };
-  draw_shell("Drastic DS", "A  Select     B  Resume");
-  const int portrait = ui_is_portrait();
-  const int panel_width = portrait ? ui_width() - 48 : 792;
-  const int panel_x = (ui_width() - panel_width) / 2;
-  const int panel_height = MAIN_ITEM_COUNT * 52 + 48;
-  overlay_fill_rect(panel_x, 106, panel_width, panel_height, COLOR_PANEL);
-  overlay_border_rect(panel_x, 106, panel_width, panel_height, 2,
-                      COLOR_PANEL_ALT);
-  for (int index = 0; index < (int)(sizeof(items) / sizeof(*items)); index++)
-  {
-    const char *value = NULL;
-    draw_row(panel_x + 24, 126 + index * 52, panel_width - 48,
-             menu->selection[MENU_MAIN] == index, items[index], value,
-             main_item_available(index));
-  }
+  draw_shell(menu, "主菜单", "A 确定   B 返回游戏");
+  const int x = menu_content_x() + 34;
+  const int y = menu_content_y() + 42;
+  const int width = menu_content_width() - 68;
+  overlay_draw_text_scaled(x, y, 2, COLOR_TEXT, "GBAStation DraStic");
+  overlay_fill_rect(x, y + 48, width, 1, 0x5556748du);
+  overlay_draw_wrapped(x, y + 78, width, 5, COLOR_MUTED,
+      "使用方向键或左摇杆选择左侧功能，按 A 确定。菜单打开时游戏已暂停。");
+  overlay_draw_wrapped(x, y + 178, width, 5, COLOR_MUTED,
+      "即时存档、金手指、画面布局、滤镜、模拟器参数和输入设置都会保存到当前配置。");
   draw_status(menu);
 }
 
 static void render_states(DrasticIngameMenu *menu) {
-  draw_shell("Save states",
-             "A  Load     X  Save / overwrite     Y  Delete     B  Back");
-  char heading[64];
-  snprintf(heading, sizeof(heading), "Slot %d preview",
-           menu->selection[MENU_STATES]);
+  draw_shell(menu, "即时存档",
+             "A 读取   X 保存/覆盖   Y 删除   B 返回");
   const int saving = menu->core.is_saving &&
       menu->core.is_saving(menu->core.env, menu->core.clazz);
   int saving_slot = -1;
   if (saving && menu->core.get_saving_slot)
     saving_slot = menu->core.get_saving_slot(menu->core.env,
                                               menu->core.clazz);
-
-  if (ui_is_portrait()) {
-    const int width = ui_width();
-    overlay_fill_rect(24, 96, width - 48, 500, COLOR_PANEL);
-    for (int slot = 0; slot < 10; slot++) {
-      char label[40];
-      snprintf(label, sizeof(label), "Slot %d%s", slot,
-               slot == *menu->state_slot ? "  [active]" : "");
-      draw_row(42, 108 + slot * 46, width - 84,
-               slot == menu->selection[MENU_STATES], label, NULL, 1);
-    }
-    overlay_fill_rect(24, 616, width - 48, ui_height() - 732,
-                      COLOR_PANEL);
-    overlay_draw_text(48, 640, COLOR_TEXT, heading);
-    if (menu->snapshot_valid) {
-      overlay_blit_snapshot(72, 682, 256, 192,
-                            menu->snapshot_top, 256, 192);
-      overlay_blit_snapshot(392, 682, 256, 192,
-                            menu->snapshot_bottom, 256, 192);
-      overlay_draw_text(144, 890, COLOR_MUTED, "Top screen");
-      overlay_draw_text(432, 890, COLOR_MUTED, "Touch screen");
-    } else {
-      overlay_border_rect(72, 682, width - 144, 224, 2, COLOR_PANEL_ALT);
-      overlay_draw_text(264, 786, COLOR_MUTED, "No preview available");
-    }
-    if (saving) {
-      char label[64];
-      snprintf(label, sizeof(label), "Saving slot %d...", saving_slot);
-      overlay_draw_text(48, 932, COLOR_WARN, label);
-    }
-    overlay_draw_wrapped(48, 976, width - 96, 10, COLOR_MUTED,
-        "Save-state slots are per title. In-game saves remain the recommended "
-        "long-term format; states can depend on this Drastic build.");
-  } else {
-    overlay_fill_rect(40, 100, 430, 526, COLOR_PANEL);
-    for (int slot = 0; slot < 10; slot++) {
-      char label[40];
-      snprintf(label, sizeof(label), "Slot %d%s", slot,
-               slot == *menu->state_slot ? "  [active]" : "");
-      draw_row(58, 116 + slot * 48, 394,
-               slot == menu->selection[MENU_STATES], label, NULL, 1);
-    }
-    overlay_fill_rect(492, 100, 748, 526, COLOR_PANEL);
-    overlay_draw_text(520, 122, COLOR_TEXT, heading);
-    if (menu->snapshot_valid) {
-      overlay_blit_snapshot(594, 164, 256, 192,
-                            menu->snapshot_top, 256, 192);
-      overlay_blit_snapshot(878, 164, 256, 192,
-                            menu->snapshot_bottom, 256, 192);
-      overlay_draw_text(650, 372, COLOR_MUTED, "Top screen");
-      overlay_draw_text(918, 372, COLOR_MUTED, "Touch screen");
-    } else {
-      overlay_border_rect(594, 164, 540, 224, 2, COLOR_PANEL_ALT);
-      overlay_draw_text(754, 266, COLOR_MUTED, "No preview available");
-    }
-    if (saving) {
-      char label[64];
-      snprintf(label, sizeof(label), "Saving slot %d...", saving_slot);
-      overlay_draw_text(520, 430, COLOR_WARN, label);
-    }
-    overlay_draw_wrapped(520, 474, 680, 6, COLOR_MUTED,
-        "Save-state slots are per title. In-game saves remain the recommended "
-        "long-term format; states can depend on this Drastic build.");
+  const int x = menu_content_x() + 24;
+  const int y = menu_content_y() + 22;
+  const int width = menu_content_width() - 48;
+  overlay_draw_text(x, y, COLOR_TEXT, "选择槽位后：A 读取，X 保存，Y 删除");
+  const int columns = ui_is_portrait() ? 1 : 2;
+  const int card_width = (width - (columns - 1) * 18) / columns;
+  for (int slot = 0; slot < 10; slot++) {
+    const int column = slot % columns;
+    const int row = slot / columns;
+    const int card_x = x + column * (card_width + 18);
+    const int card_y = y + 42 + row * 78;
+    char label[64];
+    snprintf(label, sizeof(label), "槽位 %d%s", slot,
+             slot == *menu->state_slot ? "  [当前]" : "");
+    draw_row(card_x, card_y, card_width,
+             slot == menu->selection[MENU_STATES], label,
+             slot == menu->selection[MENU_STATES] && menu->snapshot_valid
+                 ? "已有状态" : "空槽", 1);
+  }
+  if (saving) {
+    char label[64];
+    snprintf(label, sizeof(label), "正在保存槽位 %d...", saving_slot);
+    overlay_draw_text(x, y + menu_content_height() - 38, COLOR_WARN, label);
   }
   draw_status(menu);
 }
 
 static void render_cheats(DrasticIngameMenu *menu) {
-  draw_shell("Per-title cheats",
-             "A  Add / toggle     X  Delete custom     B  Back");
+  draw_shell(menu, "金手指设置",
+             "A 添加/开关   X 删除自定义   B 返回");
   const int portrait = ui_is_portrait();
-  const int list_x = portrait ? 24 : 28;
-  const int list_y = 94;
-  const int list_width = portrait ? ui_width() - 48 : 780;
-  const int detail_x = portrait ? 24 : 826;
-  const int detail_y = portrait ? 650 : 94;
-  const int detail_width = portrait ? ui_width() - 48 : 426;
-  const int detail_height = portrait ? ui_height() - 766 : 536;
+  const int list_x = menu_content_x() + 18;
+  const int list_y = menu_content_y() + 18;
+  const int list_width = portrait ? menu_content_width() - 36 :
+      (menu_content_width() * 56) / 100;
+  const int detail_x = portrait ? list_x : list_x + list_width + 18;
+  const int detail_y = portrait ? list_y + 310 : list_y;
+  const int detail_width = portrait ? list_width :
+      menu_content_width() - (detail_x - menu_content_x()) - 18;
+  const int detail_height = portrait ? menu_content_height() - 328 :
+      menu_content_height() - 36;
   const int content_x = detail_x + 24;
   const int content_y = detail_y + 28;
   const int content_width = detail_width - 48;
-  overlay_fill_rect(list_x, list_y, list_width, 536, COLOR_PANEL);
-  overlay_fill_rect(detail_x, detail_y, detail_width, detail_height,
-                    COLOR_PANEL);
+  overlay_fill_rect(list_x, list_y, list_width, portrait ? 292 : detail_height,
+                    COLOR_PANEL_ALT);
+  overlay_fill_rect(detail_x, detail_y, detail_width, detail_height, COLOR_PANEL);
   const int count = menu->cheat_count + 1;
   int selection = clamp_int(menu->selection[MENU_CHEATS], 0, count - 1);
   int scroll = menu->scroll[MENU_CHEATS];
   if (selection < scroll) scroll = selection;
-  if (selection >= scroll + 11) scroll = selection - 10;
-  scroll = clamp_int(scroll, 0, count > 11 ? count - 11 : 0);
+  const int visible_rows = portrait ? 5 : 10;
+  if (selection >= scroll + visible_rows) scroll = selection - visible_rows + 1;
+  scroll = clamp_int(scroll, 0, count > visible_rows ? count - visible_rows : 0);
   menu->scroll[MENU_CHEATS] = scroll;
-  for (int row = 0; row < 11 && scroll + row < count; row++) {
+  for (int row = 0; row < visible_rows && scroll + row < count; row++) {
     const int item = scroll + row;
     if (!item) {
-      draw_row(list_x + 16, 108 + row * 46, list_width - 32,
+      draw_row(list_x + 12, list_y + 14 + row * 48, list_width - 24,
                selection == item,
-               "+ Add custom Action Replay cheat", NULL, 1);
+               "+ 添加自定义 Action Replay 金手指", NULL, 1);
       continue;
     }
     MenuCheat *cheat = &menu->cheats[item - 1];
-    draw_row(list_x + 16, 108 + row * 46, list_width - 32,
+    draw_row(list_x + 12, list_y + 14 + row * 48, list_width - 24,
              selection == item, cheat->name,
-             cheat->enabled ? "ON" : "OFF", 1);
+             cheat->enabled ? "开" : "关", 1);
   }
   if (!selection) {
     overlay_draw_text(content_x, content_y, COLOR_ACCENT,
-                      "Custom cheat editor");
+                      "自定义金手指编辑器");
     overlay_draw_wrapped(content_x, content_y + 42, content_width,
                          portrait ? 22 : 14, COLOR_MUTED,
-        "Create a named Action Replay code using the Switch software "
-        "keyboard. Enter hexadecimal address/value pairs separated by spaces "
-        "or new lines. Custom cheats are stored by Drastic for this title.");
+        "通过 Switch 软件键盘创建并命名 Action Replay 代码。请输入以空格或换行分隔的十六进制地址/数值对。自定义金手指会由 DraStic 按游戏保存。");
   } else {
     const MenuCheat *cheat = &menu->cheats[selection - 1];
     overlay_draw_text_clipped(content_x, content_y, content_width,
                               COLOR_TEXT, cheat->name);
     overlay_draw_text(content_x, content_y + 40,
                       cheat->enabled ? COLOR_GOOD : COLOR_MUTED,
-                      cheat->enabled ? "Enabled" : "Disabled");
+                      cheat->enabled ? "已启用" : "已关闭");
     overlay_draw_text(content_x, content_y + 78, COLOR_ACCENT,
-                      cheat->custom ? "Custom cheat" : "Database cheat");
+                      cheat->custom ? "自定义金手指" : "数据库金手指");
     if (!cheat->custom && cheat->folder >= 0 &&
         cheat->folder < menu->folder_count &&
         menu->folders[cheat->folder][0]) {
-      overlay_draw_text(content_x, content_y + 116, COLOR_MUTED, "Folder:");
+      overlay_draw_text(content_x, content_y + 116, COLOR_MUTED, "分类：");
       overlay_draw_text_clipped(content_x, content_y + 144, content_width,
                                 COLOR_TEXT,
                                 menu->folders[cheat->folder]);
     }
     if (cheat->note[0]) {
-      overlay_draw_text(content_x, content_y + 192, COLOR_MUTED, "Note:");
+      overlay_draw_text(content_x, content_y + 192, COLOR_MUTED, "说明：");
       overlay_draw_wrapped(content_x, content_y + 222, content_width,
                            portrait ? 16 : 14, COLOR_TEXT, cheat->note);
     }
@@ -765,8 +774,8 @@ static void render_cheats(DrasticIngameMenu *menu) {
 
 static const char *layout_label(DrasticLayoutMode layout) {
   static const char *labels[] = {
-    "Vertical", "Horizontal", "Top only", "Touch only", "Hybrid top",
-    "Hybrid touch", "Custom"
+    "纵向", "横向", "仅上屏", "仅触摸屏", "上屏优先",
+    "触摸屏优先", "自定义"
   };
   return (unsigned)layout < sizeof(labels) / sizeof(*labels)
       ? labels[layout] : labels[0];
@@ -774,8 +783,8 @@ static const char *layout_label(DrasticLayoutMode layout) {
 
 static const char *filter_label(DrasticVideoFilter filter) {
   static const char *labels[DRASTIC_FILTER_COUNT] = {
-    "Nearest", "Linear", "Quilez", "Scanline", "Scale2x", "HQ2x", "FXAA",
-    "FXAA HQ", "SMAA", "Custom"
+    "最近邻", "线性", "Quilez", "扫描线", "Scale2x", "HQ2x", "FXAA",
+    "FXAA 高质量", "SMAA", "自定义"
   };
   return (unsigned)filter < DRASTIC_FILTER_COUNT ? labels[filter] : labels[0];
 }
@@ -787,7 +796,7 @@ static const char *custom_shader_name(const DrasticIngameMenu *menu,
       return menu->custom_shaders[index].name;
   const char *slash = relative_path ? strrchr(relative_path, '/') : NULL;
   return relative_path && relative_path[0] ? (slash ? slash + 1 : relative_path)
-                                           : "Not selected";
+                                           : "未选择";
 }
 
 static const char *filter_picker_label(const DrasticIngameMenu *menu) {
@@ -795,17 +804,17 @@ static const char *filter_picker_label(const DrasticIngameMenu *menu) {
     return menu->filter_picker_index >= 0 &&
            menu->filter_picker_index < DRASTIC_FILTER_CUSTOM
         ? filter_label((DrasticVideoFilter)menu->filter_picker_index)
-        : "Nearest";
+        : "最近邻";
   return menu->filter_picker_index >= 0 &&
          menu->filter_picker_index < menu->custom_shader_count
       ? menu->custom_shaders[menu->filter_picker_index].name
-      : "Not selected";
+      : "未选择";
 }
 
 static void render_filter_picker(DrasticIngameMenu *menu) {
   char selection[160];
   snprintf(selection, sizeof(selection), "%s   <  %s  >",
-           menu->filter_picker_custom ? "Custom shader" : "Filter",
+           menu->filter_picker_custom ? "自定义滤镜" : "滤镜",
            filter_picker_label(menu));
 
   /* Keep the game unobstructed while previewing filters. The overlay buffer
@@ -818,13 +827,13 @@ static void render_filter_picker(DrasticIngameMenu *menu) {
   const int height = show_error ? 80 : 52;
   overlay_fill_rect(x, y, width, height, 0xff18202cu);
   overlay_border_rect(x, y, width, height, 2, COLOR_ACCENT);
-  overlay_draw_text(x + 24, y + 18, COLOR_MUTED, "B  Cancel");
+  overlay_draw_text(x + 24, y + 18, COLOR_MUTED, "B 取消");
   const int selection_x = x + (portrait ? 176 : 190);
   const int selection_width = width - (portrait ? 336 : 380);
   overlay_draw_text_scrolling(selection_x, y + 18, selection_width,
                               COLOR_TEXT, selection);
   overlay_draw_text_right(x + width - 24, y + 18,
-                          COLOR_MUTED, "A  Apply");
+                          COLOR_MUTED, "A 应用");
   if (show_error)
     overlay_draw_text_clipped(x + 24, y + 50, width - 48,
                               COLOR_WARN, menu->status);
@@ -832,28 +841,27 @@ static void render_filter_picker(DrasticIngameMenu *menu) {
 
 static void render_display(DrasticIngameMenu *menu) {
   static const char *labels[] = {
-    "Screen layout", "Swap DS screens", "Rotation", "Screen gap",
-    "Integer scaling", "Drastic filter", "Custom shader",
-    "Custom layout editor", "Back"
+    "画面布局", "交换上下屏", "旋转", "屏幕间距",
+    "整数倍缩放", "内置滤镜", "自定义滤镜",
+    "自定义画面布局", "返回"
   };
   char values[9][112] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%s", layout_label(menu->config->layout));
-  snprintf(values[1], sizeof(values[1]), "%s", menu->config->swap_screens ? "On" : "Off");
-  snprintf(values[2], sizeof(values[2]), "%d degrees", (menu->config->rotation & 3) * 90);
+  snprintf(values[1], sizeof(values[1]), "%s", menu->config->swap_screens ? "开" : "关");
+  snprintf(values[2], sizeof(values[2]), "%d 度", (menu->config->rotation & 3) * 90);
   snprintf(values[3], sizeof(values[3]), "%d px", menu->config->screen_gap);
-  snprintf(values[4], sizeof(values[4]), "%s", menu->config->integer_scale ? "On" : "Off");
+  snprintf(values[4], sizeof(values[4]), "%s", menu->config->integer_scale ? "开" : "关");
   snprintf(values[5], sizeof(values[5]), "%s",
            filter_label(menu->config->video_filter));
   snprintf(values[6], sizeof(values[6]), "%s",
            custom_shader_name(menu, menu->config->custom_shader));
-  draw_shell("Screen layout & filters",
-             "Left / Right  Change     A  Select     B  Back");
-  const int panel_x = ui_is_portrait() ? 24 : 156;
-  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
-  overlay_fill_rect(panel_x, 102, panel_width, 518, COLOR_PANEL);
+  draw_shell(menu, "画面设置",
+             "左右 调整   A 选择   B 返回");
+  const int panel_x = menu_content_x();
+  const int panel_width = menu_content_width();
   for (int index = 0; index < 9; index++) {
     const int row_x = panel_x + 24;
-    const int row_y = 122 + index * 52;
+    const int row_y = menu_content_y() + 22 + index * 52;
     const int row_width = panel_width - 48;
     const int selected = menu->selection[MENU_DISPLAY] == index;
     if (index == 6)
@@ -866,21 +874,21 @@ static void render_display(DrasticIngameMenu *menu) {
   draw_status(menu);
 }
 
-static const char *on_off(int value) { return value ? "On" : "Off"; }
+static const char *on_off(int value) { return value ? "开" : "关"; }
 
 static const char *stylus_mode_label(DrasticStylusMode mode) {
-  static const char *labels[] = {"Off", "Right stick", "Motion controls"};
+  static const char *labels[] = {"关闭", "右摇杆", "体感控制"};
   return (unsigned)mode < sizeof(labels) / sizeof(*labels)
       ? labels[mode] : labels[0];
 }
 
 static void render_emulation(DrasticIngameMenu *menu) {
   static const char *labels[] = {
-    "Frames to skip", "Frame-skip method", "Safe frame skipping",
-    "Fast-forward speed", "Threaded 3D", "Cheats master switch",
-    "Show FPS", "Autosave interval", "Back"
+    "跳帧数量", "跳帧方式", "安全跳帧",
+    "快进速度", "多线程 3D", "金手指总开关",
+    "显示 FPS", "自动存档间隔", "返回"
   };
-  static const char *methods[] = {"Automatic", "Fixed", "Aggressive", "Maximum"};
+  static const char *methods[] = {"自动", "固定", "激进", "最大"};
   char values[9][48] = {{0}};
   const int frameskip = prefs_get_int("Drastic/FrameskipValue", 0);
   const int method = clamp_int(prefs_get_int("Drastic/FrameskipType", 0), 0, 3);
@@ -890,23 +898,22 @@ static void render_emulation(DrasticIngameMenu *menu) {
   snprintf(values[1], sizeof(values[1]), "%s", methods[method]);
   snprintf(values[2], sizeof(values[2]), "%s", on_off(prefs_get_bool("Drastic/FrameskipSafe", false)));
   static const char *ff_speeds[] = {
-    "50%", "150%", "200%", "300%", "400%", "Unlimited"
+    "50%", "150%", "200%", "300%", "400%", "不限"
   };
   snprintf(values[3], sizeof(values[3]), "%s", ff_speeds[ff]);
   snprintf(values[4], sizeof(values[4]), "%s", on_off(prefs_get_bool("Drastic/Threaded3D", true)));
   snprintf(values[5], sizeof(values[5]), "%s", on_off(prefs_get_bool("Drastic/CheatsEnabled", true)));
   snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->show_fps));
   if (autosave)
-    snprintf(values[7], sizeof(values[7]), "%d min", autosave / 60);
+    snprintf(values[7], sizeof(values[7]), "%d 分钟", autosave / 60);
   else
-    snprintf(values[7], sizeof(values[7]), "Off");
-  draw_shell("Emulation options",
-             "Left / Right  Change     A  Toggle     B  Back");
-  const int panel_x = ui_is_portrait() ? 24 : 156;
-  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
-  overlay_fill_rect(panel_x, 98, panel_width, 508, COLOR_PANEL);
+    snprintf(values[7], sizeof(values[7]), "关闭");
+  draw_shell(menu, "模拟设置",
+             "左右 调整   A 开关   B 返回");
+  const int panel_x = menu_content_x();
+  const int panel_width = menu_content_width();
   for (int index = 0; index < 9; index++)
-    draw_row(panel_x + 24, 114 + index * 52, panel_width - 48,
+    draw_row(panel_x + 24, menu_content_y() + 22 + index * 52, panel_width - 48,
              menu->selection[MENU_EMULATION] == index, labels[index],
              index < 8 ? values[index] : NULL, 1);
   draw_status(menu);
@@ -914,27 +921,27 @@ static void render_emulation(DrasticIngameMenu *menu) {
 
 static void render_audio_input(DrasticIngameMenu *menu) {
   static const char *labels[] = {
-    "Volume", "Sound", "Microphone", "Microphone source",
-    "Microphone level", "Rumble Pak vibration", "Gyro & accelerometer",
-    "Virtual stylus", "USB mouse stylus", "Back"
+    "音量", "声音", "麦克风", "麦克风来源",
+    "麦克风级别", "震动卡震动", "陀螺仪与加速度计",
+    "虚拟触笔", "USB 鼠标触笔", "返回"
   };
-  static const char *levels[] = {"Low", "Normal", "High", "Maximum"};
+  static const char *levels[] = {"低", "普通", "高", "最高"};
   char values[10][64] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%d%%", menu->config->volume);
   snprintf(values[1], sizeof(values[1]), "%s", on_off(prefs_get_bool("Drastic/SoundEnabled", true)));
   snprintf(values[2], sizeof(values[2]), "%s",
            on_off(menu->config->microphone_enabled));
   if (menu->config->microphone_source == DRASTIC_MICROPHONE_EXTERNAL) {
-    const char *state = "External";
+    const char *state = "外接";
     if (menu->microphone_status == OPENSLES_MIC_STATUS_ACTIVE)
-      state = "External (active)";
+      state = "外接（已启用）";
     else if (menu->microphone_status == OPENSLES_MIC_STATUS_CONNECTING)
-      state = "External (connecting)";
+      state = "外接（连接中）";
     else if (menu->microphone_status == OPENSLES_MIC_STATUS_UNAVAILABLE)
-      state = "External (not detected)";
+      state = "外接（未检测到）";
     snprintf(values[3], sizeof(values[3]), "%s", state);
   } else {
-    snprintf(values[3], sizeof(values[3]), "Simulated noise");
+    snprintf(values[3], sizeof(values[3]), "模拟噪声");
   }
   snprintf(values[4], sizeof(values[4]), "%s",
            levels[clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3)]);
@@ -944,19 +951,18 @@ static void render_audio_input(DrasticIngameMenu *menu) {
            stylus_mode_label(menu->config->stylus_mode));
   snprintf(values[8], sizeof(values[8]), "%s",
            on_off(menu->config->mouse_stylus));
-  draw_shell("Audio, input & motion",
-             "Left / Right  Change     A  Toggle     B  Back");
-  const int panel_x = ui_is_portrait() ? 24 : 156;
-  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
-  overlay_fill_rect(panel_x, 98, panel_width, 478, COLOR_PANEL);
+  draw_shell(menu, "音频与输入",
+             "左右 调整   A 开关   B 返回");
+  const int panel_x = menu_content_x();
+  const int panel_width = menu_content_width();
   for (int index = 0; index < 10; index++)
-    draw_row(panel_x + 24, 110 + index * 45, panel_width - 48,
+    draw_row(panel_x + 24, menu_content_y() + 18 + index * 45, panel_width - 48,
              menu->selection[MENU_AUDIO_INPUT] == index, labels[index],
              index < 9 ? values[index] : NULL, 1);
-  overlay_draw_wrapped(panel_x + 24, 590, panel_width - 48,
+  overlay_draw_wrapped(panel_x + 24, menu_content_y() + menu_content_height() - 60,
+                       panel_width - 48,
                        ui_is_portrait() ? 8 : 3, COLOR_MUTED,
-      "External uses a connected CTIA headset or compatible USB microphone. "
-      "Motion stylus uses its recenter hotkey; a mouse left-click touches.");
+      "外接麦克风可使用 CTIA 耳麦或兼容 USB 麦克风。体感触笔使用回中热键；鼠标左键可触摸。");
   draw_status(menu);
 }
 
@@ -1037,7 +1043,7 @@ static void render_layout_editor(DrasticIngameMenu *menu) {
   const int canvas_height = ui_height();
   overlay_fill_rect(0, 0, canvas_width, canvas_height, 0x33000000u);
   overlay_fill_rect(0, 0, canvas_width, 70, COLOR_PANEL);
-  overlay_draw_text_scaled(24, 16, 2, COLOR_TEXT, "Custom screen layout");
+  overlay_draw_text_scaled(24, 16, 2, COLOR_TEXT, "自定义画面布局");
   for (int screen = 0; screen < 2; screen++) {
     const DrasticScreenRect *rect = &menu->config->custom_screens[screen];
     int x, y, width, height;
@@ -1048,15 +1054,15 @@ static void render_layout_editor(DrasticIngameMenu *menu) {
                         color);
     overlay_fill_rect(x + 8, y + 8, 136, 30, 0xd0101820u);
     overlay_draw_text(x + 16, y + 15, color,
-                      screen ? "TOUCH" : "TOP");
+                      screen ? "触摸屏" : "上屏");
   }
   overlay_fill_rect(0, canvas_height - 88, canvas_width, 88, COLOR_PANEL);
   overlay_draw_text_clipped(24, canvas_height - 72, canvas_width - 48,
       COLOR_TEXT,
-      "Left stick / D-Pad: move    Right stick / ZL+D-Pad: resize");
+      "左摇杆/方向键：移动    右摇杆/ZL+方向键：调整尺寸");
   overlay_draw_text_clipped(24, canvas_height - 40, canvas_width - 48,
       COLOR_MUTED,
-      "X: select screen    Y: reset    A: save    B: cancel");
+      "X：选择屏幕    Y：重置    A：保存    B：取消");
 }
 
 static void render_menu(DrasticIngameMenu *menu) {
@@ -1163,28 +1169,28 @@ static void update_states(DrasticIngameMenu *menu, u64 pressed) {
     const int result = menu->core.load_state(menu->core.env, menu->core.clazz,
                                              slot);
     if (result) drastic_menu_close(menu, true);
-    else set_status(menu, "This slot could not be loaded");
+    else set_status(menu, "无法读取此槽位");
   }
   if ((pressed & HidNpadButton_X) && menu->core.save_state) {
     const int result = menu->core.save_state(menu->core.env, menu->core.clazz,
                                              slot, 1);
     menu->pending_snapshot = result != 0;
-    set_status(menu, result ? "Save-state requested" :
-                              "This slot could not be saved");
+    set_status(menu, result ? "已请求保存即时存档" :
+                              "无法保存到此槽位");
   }
   if (pressed & HidNpadButton_Y) {
     if (!menu->snapshot_valid) {
-      set_status(menu, "There is no state to delete in this slot");
+      set_status(menu, "此槽位没有可删除的即时存档");
       menu->confirm_delete_slot = -1;
     } else if (menu->confirm_delete_slot != slot) {
       menu->confirm_delete_slot = slot;
-      set_status(menu, "Press Y again to permanently delete this state");
+      set_status(menu, "再次按 Y 永久删除此即时存档");
     } else {
       const int deleted = delete_matching_state(menu, slot);
       menu->confirm_delete_slot = -1;
       refresh_snapshot(menu);
-      set_status(menu, deleted ? "Save-state deleted" :
-                                 "Could not safely identify the state file");
+      set_status(menu, deleted ? "即时存档已删除" :
+                                 "无法安全识别即时存档文件");
     }
   } else if (pressed & (HidNpadButton_A | HidNpadButton_B |
                         HidNpadButton_X)) {
@@ -1230,7 +1236,7 @@ static void update_cheats(DrasticIngameMenu *menu, u64 pressed) {
     if (menu->core.update_cheats)
       menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
     if (!cheat->custom) persist_database_cheats(menu);
-    set_status(menu, cheat->enabled ? "Cheat enabled" : "Cheat disabled");
+    set_status(menu, cheat->enabled ? "金手指已启用" : "金手指已关闭");
   }
   if ((pressed & HidNpadButton_X) && cheat->custom &&
       menu->core.remove_custom_cheat) {
@@ -1239,7 +1245,7 @@ static void update_cheats(DrasticIngameMenu *menu, u64 pressed) {
     if (menu->core.update_cheats)
       menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
     refresh_cheats(menu);
-    set_status(menu, "Custom cheat deleted");
+    set_status(menu, "自定义金手指已删除");
   }
 }
 
@@ -1337,7 +1343,7 @@ static void begin_filter_picker(DrasticIngameMenu *menu, int custom,
   if (custom) {
     refresh_custom_shaders(menu);
     if (!menu->custom_shader_count) {
-      set_status(menu, "No custom shaders were found");
+      set_status(menu, "未找到自定义滤镜");
       return;
     }
   }
@@ -1377,8 +1383,8 @@ static void update_filter_picker(DrasticIngameMenu *menu, u64 pressed) {
   if (pressed & HidNpadButton_A) {
     if (!menu->filter_picker_valid) {
       set_status(menu, menu->filter_picker_custom
-          ? "This custom shader could not be loaded"
-          : "This filter could not be selected");
+          ? "无法加载此自定义滤镜"
+          : "无法选择此滤镜");
       return;
     }
     save_string("Wrapper/VideoFilter",
@@ -1566,8 +1572,8 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
       set_status(menu,
                  menu->config->microphone_source ==
                          DRASTIC_MICROPHONE_EXTERNAL
-                     ? "External input selected; connect a headset or USB microphone"
-                     : "Simulated-noise microphone selected");
+                     ? "已选择外接输入；请连接耳麦或 USB 麦克风"
+                     : "已选择模拟噪声麦克风");
       break;
     case 4:
       save_int("Drastic/MicLevel",
@@ -1589,7 +1595,7 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
                   menu->config->stylus_mode == DRASTIC_STYLUS_MOTION
                       ? "motion" : "stick");
       if (menu->config->stylus_mode == DRASTIC_STYLUS_MOTION)
-        set_status(menu, "Motion stylus will center on the current controller angle");
+        set_status(menu, "体感触笔会以当前手柄角度作为中心");
       break;
     case 8:
       menu->config->mouse_stylus ^= 1;
@@ -1658,7 +1664,7 @@ static void update_layout_editor(DrasticIngameMenu *menu, u64 held,
     save_custom_layout(menu);
     drastic_config_calculate_layout(menu->config, panel_width, panel_height);
     select_page(menu, MENU_DISPLAY);
-    set_status(menu, "Custom layout saved for this title");
+    set_status(menu, "已为当前游戏保存自定义布局");
     return;
   }
   if (pressed & HidNpadButton_X) {
@@ -1779,7 +1785,7 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
       !menu->core.is_saving(menu->core.env, menu->core.clazz))) {
     menu->pending_snapshot = 0;
     refresh_snapshot(menu);
-    set_status(menu, "Save-state complete");
+    set_status(menu, "即时存档完成");
   }
   if (menu->page == MENU_AUDIO_INPUT) {
     const OpenSLESMicrophoneStatus microphone_status =

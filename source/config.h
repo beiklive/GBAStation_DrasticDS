@@ -25,8 +25,6 @@
 #define CHEAT_DATABASE_PATH GBASTATION_DIR "/cheats/usrcheat.dat"
 #define PREFS_NAME      "drastic.ini"
 #define PREFS_PATH      DATA_ROOT "/" PREFS_NAME
-#define DEFAULT_ROM_PATH "sdmc:/nds/black.nds"
-
 #define DRASTIC_APK_VERSION_CODE 109
 #define ANDROID_SDK_INT 30
 #define ANDROID_MANUFACTURER "Nintendo"

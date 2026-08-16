@@ -20,6 +20,7 @@ namespace {
 constexpr size_t kMaxTextFile = 2u * 1024u * 1024u;
 constexpr size_t kMaxStageSource = 4u * 1024u * 1024u;
 constexpr size_t kMaxRawTexture = 64u * 1024u * 1024u;
+constexpr size_t kMaxSpirv = 8u * 1024u * 1024u;
 
 struct Section {
   std::string tag;
@@ -301,6 +302,50 @@ static bool parse_filter(const std::string &value, int &linear) {
   return true;
 }
 
+static bool load_spirv_file(const std::string &path, uint8_t **data,
+                            size_t *size, char *error, size_t error_size) {
+  std::vector<uint8_t> bytes;
+  if (!read_file(path, kMaxSpirv, bytes, error, error_size)) return false;
+  if (bytes.size() < 20 || (bytes.size() & 3) ||
+      bytes[0] != 0x03 || bytes[1] != 0x02 || bytes[2] != 0x23 ||
+      bytes[3] != 0x07) {
+    set_error(error, error_size, "%s is not valid SPIR-V", path.c_str());
+    return false;
+  }
+  uint8_t *copy = (uint8_t *)std::malloc(bytes.size());
+  if (!copy) {
+    set_error(error, error_size, "Out of memory while loading SPIR-V");
+    return false;
+  }
+  std::memcpy(copy, bytes.data(), bytes.size());
+  *data = copy;
+  *size = bytes.size();
+  return true;
+}
+
+static bool spirv_file_ready(const std::string &path, char *error,
+                             size_t error_size) {
+  FILE *file = std::fopen(path.c_str(), "rb");
+  if (!file) {
+    set_error(error, error_size, "Could not open %s", path.c_str());
+    return false;
+  }
+  uint8_t header[4] = {};
+  const bool magic = std::fread(header, 1, sizeof(header), file) ==
+                         sizeof(header) &&
+      header[0] == 0x03 && header[1] == 0x02 &&
+      header[2] == 0x23 && header[3] == 0x07;
+  const bool seek_ok = std::fseek(file, 0, SEEK_END) == 0;
+  const long length = seek_ok ? std::ftell(file) : -1;
+  std::fclose(file);
+  if (!magic || length < 20 || ((unsigned long)length & 3) ||
+      (size_t)length > kMaxSpirv) {
+    set_error(error, error_size, "%s is not valid SPIR-V", path.c_str());
+    return false;
+  }
+  return true;
+}
+
 static bool parse_manifest(const std::string &relative, unsigned flags,
                            DrasticCustomShader *shader, char *error,
                            size_t error_size) {
@@ -557,6 +602,15 @@ static bool parse_manifest(const std::string &relative, unsigned flags,
           !duplicate_string(fragment, &pass.fragment_source,
                             error, error_size)) return false;
     }
+    if (flags & DRASTIC_CUSTOM_SHADER_LOAD_SPIRV) {
+      const std::string pack = full_path(relative) + ".nxvk/pass" +
+                               std::to_string(pass_index);
+      if (!load_spirv_file(pack + ".vert.spv", &pass.vertex_spirv,
+                           &pass.vertex_spirv_size, error, error_size) ||
+          !load_spirv_file(pack + ".frag.spv", &pass.fragment_spirv,
+                           &pass.fragment_spirv_size, error, error_size))
+        return false;
+    }
   }
   return true;
 }
@@ -605,6 +659,8 @@ static void scan_directory(const std::string &relative, int depth,
     std::snprintf(entry.name, sizeof(entry.name), "%s", shader.name);
     std::snprintf(entry.relative_path, sizeof(entry.relative_path), "%s",
                   child.c_str());
+    entry.vulkan_ready = drastic_custom_shader_vulkan_ready(
+        child.c_str(), nullptr, 0);
     entries.push_back(entry);
     drastic_custom_shader_destroy(&shader);
     if (entries.size() >= 512) break;
@@ -643,6 +699,8 @@ extern "C" void drastic_custom_shader_destroy(DrasticCustomShader *shader) {
   for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_PASSES; index++) {
     std::free(shader->passes[index].vertex_source);
     std::free(shader->passes[index].fragment_source);
+    std::free(shader->passes[index].vertex_spirv);
+    std::free(shader->passes[index].fragment_spirv);
   }
   std::memset(shader, 0, sizeof(*shader));
 }
@@ -658,3 +716,17 @@ extern "C" size_t drastic_custom_shader_scan(
   return count;
 }
 
+extern "C" bool drastic_custom_shader_vulkan_ready(
+    const char *relative_path, char *error, size_t error_size) {
+  DrasticCustomShader shader{};
+  bool ready = drastic_custom_shader_load(relative_path, 0, &shader,
+                                           error, error_size);
+  for (int pass = 0; ready && pass < shader.pass_count; pass++) {
+    const std::string base = full_path(shader.relative_path) + ".nxvk/pass" +
+                             std::to_string(pass);
+    ready = spirv_file_ready(base + ".vert.spv", error, error_size) &&
+            spirv_file_ready(base + ".frag.spv", error, error_size);
+  }
+  drastic_custom_shader_destroy(&shader);
+  return ready;
+}

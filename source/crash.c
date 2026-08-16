@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "libc_shim.h"
+#include "debug_log.h"
 
 #define EXCEPTION_SLOT_COUNT 8
 #define EXCEPTION_SLOT_SIZE  0x400
@@ -110,6 +111,7 @@ real_crash:
   if (__atomic_exchange_n(&g_crashing, 1, __ATOMIC_ACQ_REL)) {
     for (;;) svcSleepThread(1000000000ULL);
   }
-  (void)ctx;
+  debug_log_exception(ctx->error_desc, ctx->pc.x, ctx->lr.x, ctx->sp.x,
+                      ctx->far.x, ctx->esr);
   svcExitProcess();
 }

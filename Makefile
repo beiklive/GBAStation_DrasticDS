@@ -10,18 +10,31 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-TARGET		:=	GBAStationDrasticStub
+TARGET		:=	GBAStationNDSStub
 APP_TITLE	:=	GBAStation Drastic Stub
 APP_AUTHOR	:=	beiklive
 APP_VERSION	:=	0.0.1
 BUILD		:=	build
-SOURCES		:=	source source/hooks
+SOURCES		:=	source source/hooks source/lsfg \
+			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
+			third_party/lsfg-vk/lsfg-vk-backend/src \
+			third_party/lsfg-vk/lsfg-vk-backend/src/extraction \
+			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
 DATA		:=	data
-INCLUDES	:=	source
+INCLUDES	:=	source source/lsfg $(PORTLIBS)/include/freetype2 \
+			third_party/lsfg-vk/lsfg-vk-common/include \
+			third_party/lsfg-vk/lsfg-vk-backend/include \
+			third_party/lsfg-vk/lsfg-vk-backend/src
+# The 26.1.4 consumer SDK packages NVK together with its required Switch
+# compatibility shims.  A different SDK can still be selected via VULKAN_SDK.
+VULKAN_SDK ?= $(abspath $(TOPDIR)/../switchVK/nvk-switch-26.1.4)
 DFX_GENERATED ?=
 ifneq ($(strip $(DFX_GENERATED)),)
 DATA		+=	$(DFX_GENERATED)/data
 INCLUDES	+=	$(DFX_GENERATED)/include
+SOURCES		+=	$(DFX_GENERATED)/src
 endif
 
 #---------------------------------------------------------------------------------
@@ -36,24 +49,29 @@ ifneq ($(strip $(DFX_GENERATED)),)
 DEFINES	+=	-DDRASTIC_DFX_GENERATED
 endif
 
-# This project now ships one standalone OpenGL host only.
-DEFINES	+=	-DUSE_OPENGL
+# NVK Vulkan host. DraStic's GLES texture uploads are captured and presented
+# through Vulkan, so switch-mesa EGL/GLES must not be linked into this build.
+DEFINES	+=	-DUSE_VULKAN -DVK_USE_PLATFORM_VI_NN
 
 CFLAGS	:=	-Wall -Wextra $(OPTIMIZATION) -DNDEBUG -ffunction-sections -fdata-sections \
 			-fno-ident -ffile-prefix-map=$(CURDIR)=. \
 			-fmacro-prefix-map=$(CURDIR)=. $(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
-CXXFLAGS	:= $(CFLAGS) -Wno-missing-field-initializers
+CXXFLAGS	:= $(CFLAGS) -Wno-missing-field-initializers -std=gnu++20
 
 ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(OPTIMIZATION) -Wl,-Map,$(notdir $*.map) \
-			-Wl,--gc-sections -Wl,--build-id=sha1
+			-Wl,--gc-sections -Wl,--build-id=sha1 -Wl,--allow-multiple-definition
 
-# nx supplies audren, HID, applet, and filesystem services. Drastic's OpenSL ES
-# ABI is implemented directly by the audren-backed source/opensles.c layer.
-# EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lminizip -lz -lnx -lstdc++ -lm
+# switchVK exports a self-contained libvulkan.a. It owns Mesa/NVK and its
+# generated Vulkan runtime, and must remain mutually exclusive with Mesa EGL.
+LIBDIRS	:= $(VULKAN_SDK) $(PORTLIBS) $(LIBNX)
+LIBS	:= -Wl,--whole-archive -lvulkan -Wl,--no-whole-archive \
+		-Wl,--wrap=vk_icdGetInstanceProcAddr \
+		-Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=stat -Wl,--wrap=lstat \
+		-Wl,--wrap=fstat \
+		-lminizip -lfreetype -lharfbuzz -lpng16 -lbz2 \
+		-lz -lzstd -lnx -lstdc++ -lm
 
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))

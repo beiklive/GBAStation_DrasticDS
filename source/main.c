@@ -15,6 +15,7 @@
 
 #include "config.h"
 #include "archive_loader.h"
+#include "debug_log.h"
 #include "drastic_compat.h"
 #include "drastic_config.h"
 #include "drastic_jit.h"
@@ -36,6 +37,53 @@
 static void *heap_so_base;
 static size_t heap_so_limit;
 so_module emu_mod;
+
+/* switchVK's NVK winsys uses libnx's nv services and must run as a full
+ * application; Album/applet launches do not have the required GPU services. */
+u32 __nx_applet_type = AppletType_Application;
+size_t __nx_heap_size = 0;
+
+typedef struct {
+  char rom_path[1024];
+  char return_nro[1024];
+  int return_to_nro;
+} DrasticLaunchOptions;
+
+static int has_nro_extension(const char *path) {
+  if (!path) return 0;
+  const char *extension = strrchr(path, '.');
+  return extension && !strcasecmp(extension, ".nro");
+}
+
+static void parse_launch_options(DrasticLaunchOptions *options, int argc,
+                                 char *argv[]) {
+  memset(options, 0, sizeof(*options));
+  snprintf(options->return_nro, sizeof(options->return_nro),
+           "sdmc:/switch/GBAStation.nro");
+  options->return_to_nro = 1;
+  for (int index = 1; index < argc; index++) {
+    const char *argument = argv[index];
+    if (!argument || !*argument) continue;
+    if (!strcmp(argument, "--return") && index + 1 < argc) {
+      snprintf(options->return_nro, sizeof(options->return_nro), "%s",
+               argv[++index] ? argv[index] : "");
+      continue;
+    }
+    if (!strcmp(argument, "--exit-to-home")) {
+      options->return_to_nro = 0;
+      continue;
+    }
+    if (!options->rom_path[0] && !has_nro_extension(argument))
+      snprintf(options->rom_path, sizeof(options->rom_path), "%s", argument);
+  }
+}
+
+static void configure_return_to_launcher(const DrasticLaunchOptions *options) {
+  if (!options || !options->return_to_nro || !options->return_nro[0]) return;
+  char arguments[sizeof(options->return_nro) + 3];
+  snprintf(arguments, sizeof(arguments), "\"%s\"", options->return_nro);
+  (void)envSetNextLoad(options->return_nro, arguments);
+}
 
 /* r2.6.0.4a stores its ARM7/ARM9 native code cache at BSS + 0x92000.
  * The three adjacent areas it marks RWX are 16 MiB, 1 MiB and 2 MiB. */
@@ -347,24 +395,53 @@ static const SwitchButton switch_buttons[] = {
 
 typedef struct {
   const char *key;
-  const char *fallback;
   int ds_mask;
   u64 switch_mask;
 } DsBinding;
 
 static DsBinding bindings[] = {
-  {"Wrapper/Pad/A","A",DS_A,0},{"Wrapper/Pad/B","B",DS_B,0},
-  {"Wrapper/Pad/X","X",DS_X,0},{"Wrapper/Pad/Y","Y",DS_Y,0},
-  {"Wrapper/Pad/L","L",DS_L,0},{"Wrapper/Pad/R","R",DS_R,0},
-  {"Wrapper/Pad/Start","Plus",DS_START,0},
-  {"Wrapper/Pad/Select","Minus",DS_SELECT,0},
-  {"Wrapper/Pad/Up","Up",DS_UP,0},{"Wrapper/Pad/Down","Down",DS_DOWN,0},
-  {"Wrapper/Pad/Left","Left",DS_LEFT,0},
-  {"Wrapper/Pad/Right","Right",DS_RIGHT,0},
+  {"nds.handle.a",DS_A,0},{"nds.handle.b",DS_B,0},
+  {"nds.handle.x",DS_X,0},{"nds.handle.y",DS_Y,0},
+  {"nds.handle.l",DS_L,0},{"nds.handle.r",DS_R,0},
+  {"nds.handle.start",DS_START,0},{"nds.handle.select",DS_SELECT,0},
+  {"nds.handle.up",DS_UP,0},{"nds.handle.down",DS_DOWN,0},
+  {"nds.handle.left",DS_LEFT,0},{"nds.handle.right",DS_RIGHT,0},
 };
 
 static u64 button_for_token(const char *token) {
   if (!token || !*token || !strcasecmp(token, "None")) return 0;
+  if (!strcasecmp(token, "PAD_A")) return HidNpadButton_A;
+  if (!strcasecmp(token, "PAD_B")) return HidNpadButton_B;
+  if (!strcasecmp(token, "PAD_X")) return HidNpadButton_X;
+  if (!strcasecmp(token, "PAD_Y")) return HidNpadButton_Y;
+  if (!strcasecmp(token, "PAD_L") || !strcasecmp(token, "PAD_LB") || !strcasecmp(token, "LB")) return HidNpadButton_L;
+  if (!strcasecmp(token, "PAD_R") || !strcasecmp(token, "PAD_RB") || !strcasecmp(token, "RB")) return HidNpadButton_R;
+  if (!strcasecmp(token, "PAD_LT") || !strcasecmp(token, "PAD_ZL") || !strcasecmp(token, "LT") || !strcasecmp(token, "ZL")) return HidNpadButton_ZL;
+  if (!strcasecmp(token, "PAD_RT") || !strcasecmp(token, "PAD_ZR") || !strcasecmp(token, "RT") || !strcasecmp(token, "ZR")) return HidNpadButton_ZR;
+  if (!strcasecmp(token, "PAD_LSB") || !strcasecmp(token, "LSB")) return HidNpadButton_StickL;
+  if (!strcasecmp(token, "PAD_RSB") || !strcasecmp(token, "RSB")) return HidNpadButton_StickR;
+  if (!strcasecmp(token, "PAD_START") || !strcasecmp(token, "PAD_PLUS") || !strcasecmp(token, "START") || !strcasecmp(token, "PLUS")) return HidNpadButton_Plus;
+  if (!strcasecmp(token, "PAD_BACK") || !strcasecmp(token, "PAD_MINUS") || !strcasecmp(token, "BACK") || !strcasecmp(token, "SELECT") || !strcasecmp(token, "MINUS")) return HidNpadButton_Minus;
+  if (!strcasecmp(token, "PAD_UP")) return HidNpadButton_Up;
+  if (!strcasecmp(token, "PAD_DOWN")) return HidNpadButton_Down;
+  if (!strcasecmp(token, "PAD_LEFT")) return HidNpadButton_Left;
+  if (!strcasecmp(token, "PAD_RIGHT")) return HidNpadButton_Right;
+  if (!strcasecmp(token, "PAD_LEFTSTICKUP"))
+    return DRASTIC_INPUT_VIRTUAL_LEFT_UP;
+  if (!strcasecmp(token, "PAD_LEFTSTICKDOWN"))
+    return DRASTIC_INPUT_VIRTUAL_LEFT_DOWN;
+  if (!strcasecmp(token, "PAD_LEFTSTICKLEFT"))
+    return DRASTIC_INPUT_VIRTUAL_LEFT_LEFT;
+  if (!strcasecmp(token, "PAD_LEFTSTICKRIGHT"))
+    return DRASTIC_INPUT_VIRTUAL_LEFT_RIGHT;
+  if (!strcasecmp(token, "PAD_RIGHTSTICKUP"))
+    return DRASTIC_INPUT_VIRTUAL_RIGHT_UP;
+  if (!strcasecmp(token, "PAD_RIGHTSTICKDOWN"))
+    return DRASTIC_INPUT_VIRTUAL_RIGHT_DOWN;
+  if (!strcasecmp(token, "PAD_RIGHTSTICKLEFT"))
+    return DRASTIC_INPUT_VIRTUAL_RIGHT_LEFT;
+  if (!strcasecmp(token, "PAD_RIGHTSTICKRIGHT"))
+    return DRASTIC_INPUT_VIRTUAL_RIGHT_RIGHT;
   for (unsigned index = 0; index < sizeof(switch_buttons) / sizeof(*switch_buttons);
        index++)
     if (!strcasecmp(token, switch_buttons[index].name))
@@ -377,6 +454,8 @@ static u64 buttons_for_combo(const char *combo) {
   char copy[192];
   if (strlen(combo) >= sizeof(copy)) return 0;
   strcpy(copy, combo);
+  char *alternative = strchr(copy, '|');
+  if (alternative) *alternative = '\0';
   u64 result = 0;
   char *save = NULL;
   for (char *token = strtok_r(copy, "+", &save); token;
@@ -394,15 +473,119 @@ static u64 buttons_for_combo(const char *combo) {
 static int analog_dpad_enabled;
 static int analog_dpad_deadzone;
 
+/* config.cfg is shared with BeikLiveStation/nds_stub. Values are stored as
+ * typed records (for example `nds.handle.a=s|PAD_A`). Button assignments are
+ * intentionally absent when a key is not present: this host no longer ships
+ * its own default binding table. */
+static void launcher_mapping_value(const char *wanted, char *output,
+                                   size_t output_size) {
+  static const char *paths[] = {
+    "sdmc:/GBAStation/config/config.cfg",
+    "/GBAStation/config/config.cfg",
+  };
+  if (!output || !output_size) return;
+  output[0] = '\0';
+  for (unsigned path_index = 0;
+       path_index < sizeof(paths) / sizeof(*paths) && !output[0]; path_index++) {
+    FILE *file = fopen(paths[path_index], "rb");
+    if (!file) continue;
+    char line[2048];
+    while (fgets(line, sizeof(line), file)) {
+      char *key = line;
+      while (*key && isspace((unsigned char)*key)) key++;
+      char *equals = strchr(key, '=');
+      if (!equals) continue;
+      *equals = '\0';
+      char *end = equals - 1;
+      while (end >= key && isspace((unsigned char)*end)) *end-- = '\0';
+      if (strcmp(key, wanted)) continue;
+      char *value = equals + 1;
+      while (*value && isspace((unsigned char)*value)) value++;
+      char *separator = strchr(value, '|');
+      if (separator && separator > value && separator <= value + 3)
+        value = separator + 1;
+      end = value + strlen(value);
+      while (end > value && isspace((unsigned char)end[-1])) *--end = '\0';
+      /* The shared launcher stores literal separators as escaped characters
+       * (for example PAD_LT+PAD_RT\\|PAD_RSB).  Decode those escapes before
+       * splitting alternatives, matching nds_stub's configValuePayload(). */
+      char decoded[sizeof(line)];
+      size_t written = 0;
+      for (const char *source = value;
+           *source && written + 1 < sizeof(decoded); source++) {
+        if (*source == '\\' && source[1]) source++;
+        decoded[written++] = *source;
+      }
+      decoded[written] = '\0';
+      snprintf(output, output_size, "%s", decoded);
+      /* nds_stub loads this file into a key/value map, so a later record
+       * supersedes an earlier default or stale record.  Keep scanning for
+       * that same last-record-wins behaviour. */
+    }
+    fclose(file);
+  }
+}
+
+static u64 launcher_mapping_combo(const char *key) {
+  char value[256];
+  launcher_mapping_value(key, value, sizeof(value));
+  return buttons_for_combo(value);
+}
+
+static void debug_log_nds_mapping(const char *key) {
+  char value[256];
+  launcher_mapping_value(key, value, sizeof(value));
+  debug_logf("input mapping key=%s value=%s mask=0x%llx", key,
+             value[0] ? value : "(unbound)",
+             (unsigned long long)buttons_for_combo(value));
+}
+
+static void debug_log_all_nds_mappings(void) {
+  static const char *const keys[] = {
+    "nds.handle.a", "nds.handle.b", "nds.handle.x", "nds.handle.y",
+    "nds.handle.l", "nds.handle.r", "nds.handle.start",
+    "nds.handle.select", "nds.handle.up", "nds.handle.down",
+    "nds.handle.left", "nds.handle.right", "nds.handle.fastforward",
+    "nds.handle.autofire", "nds.handle.a_turbo", "nds.handle.b_turbo",
+    "nds.hotkey.menu.pad", "nds.hotkey.quicksave.pad",
+    "nds.hotkey.quickload.pad", "nds.hotkey.next_slot.pad",
+    "nds.hotkey.previous_slot.pad", "nds.hotkey.reset.pad",
+    "nds.hotkey.quit.pad", "nds.hotkey.swap_screens.pad",
+    "nds.hotkey.mic_blow.pad", "nds.hotkey.lid.pad",
+    "nds.hotkey.motion_recenter.pad", "nds.hotkey.pointer_click.pad",
+    "nds.hotkey.pointer_mode.pad", "nds.hotkey.pause.pad",
+    "nds.hotkey.screenshot.pad", "nds.hotkey.mute.pad",
+  };
+  debug_logf("input mapping dump begin");
+  for (unsigned index = 0; index < sizeof(keys) / sizeof(*keys); index++)
+    debug_log_nds_mapping(keys[index]);
+  debug_logf("input mapping dump end");
+}
+
+static int launcher_mapping_is(const char *key, const char *wanted) {
+  char value[64];
+  launcher_mapping_value(key, value, sizeof(value));
+  return !strcasecmp(value, wanted);
+}
+
+static int launcher_mapping_mentions_left_stick(const char *key) {
+  char value[256];
+  launcher_mapping_value(key, value, sizeof(value));
+  return strcasestr(value, "PAD_LEFTSTICK") != NULL;
+}
+
 static void load_bindings(void) {
   for (unsigned index = 0; index < sizeof(bindings) / sizeof(*bindings); index++)
-    bindings[index].switch_mask = button_for_token(
-        prefs_get_string(bindings[index].key, bindings[index].fallback));
-  analog_dpad_enabled = prefs_get_bool("Wrapper/AnalogDpad", true);
-  int percent = prefs_get_int("Wrapper/AnalogDeadzone", 35);
-  if (percent < 5) percent = 5;
-  if (percent > 80) percent = 80;
-  analog_dpad_deadzone = percent * 32767 / 100;
+    bindings[index].switch_mask = launcher_mapping_combo(bindings[index].key);
+  /* nds_stub accepts virtual left-stick direction tokens. Enable the sampler's
+   * equivalent only when the shared mapping explicitly uses them. */
+  analog_dpad_enabled =
+      launcher_mapping_mentions_left_stick("nds.handle.up") ||
+      launcher_mapping_mentions_left_stick("nds.handle.down") ||
+      launcher_mapping_mentions_left_stick("nds.handle.left") ||
+      launcher_mapping_mentions_left_stick("nds.handle.right");
+  analog_dpad_deadzone = 12000;
+  debug_log_all_nds_mappings();
 }
 
 static HidVibrationDeviceHandle vibration_player[2];
@@ -565,46 +748,37 @@ static void update_runtime_hud(RuntimeHud *hud,
 }
 
 static void load_runtime_controls(RuntimeControls *controls) {
-  controls->hotkeys.menu = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyMenu", "L+R+Plus"));
-  controls->hotkeys.fast_forward = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyFastForward", "ZR"));
-  controls->hotkeys.swap_screens = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeySwapScreens", "ZL"));
-  controls->hotkeys.microphone = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyMicrophone", "StickL"));
-  controls->hotkeys.motion_stylus_recenter = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyMotionStylusRecenter",
-                       "L+R+StickR"));
-  controls->hotkeys.autofire = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyAutoFire", "None"));
-  controls->hotkeys.lid = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyLid", "None"));
-  controls->hotkeys.save_state = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeySaveState", "L+R+Minus+Y"));
-  controls->hotkeys.load_state = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyLoadState", "L+R+Minus+X"));
-  controls->hotkeys.next_slot = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyNextSlot", "L+R+Minus+Up"));
-  controls->hotkeys.previous_slot = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyPreviousSlot", "L+R+Minus+Down"));
-  controls->hotkeys.reset = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyReset", "L+R+Minus+A"));
-  controls->hotkeys.quit = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyQuit", "None"));
+  controls->hotkeys.menu = launcher_mapping_combo("nds.hotkey.menu.pad");
+  controls->hotkeys.fast_forward = launcher_mapping_combo("nds.handle.fastforward");
+  controls->hotkeys.swap_screens = launcher_mapping_combo("nds.hotkey.swap_screens.pad");
+  controls->hotkeys.microphone = launcher_mapping_combo("nds.hotkey.mic_blow.pad");
+  controls->hotkeys.motion_stylus_recenter = launcher_mapping_combo("nds.hotkey.motion_recenter.pad");
+  controls->hotkeys.autofire = launcher_mapping_combo("nds.handle.autofire");
+  controls->hotkeys.lid = launcher_mapping_combo("nds.hotkey.lid.pad");
+  controls->hotkeys.save_state = launcher_mapping_combo("nds.hotkey.quicksave.pad");
+  controls->hotkeys.load_state = launcher_mapping_combo("nds.hotkey.quickload.pad");
+  controls->hotkeys.next_slot = launcher_mapping_combo("nds.hotkey.next_slot.pad");
+  controls->hotkeys.previous_slot = launcher_mapping_combo("nds.hotkey.previous_slot.pad");
+  controls->hotkeys.reset = launcher_mapping_combo("nds.hotkey.reset.pad");
+  controls->hotkeys.quit = launcher_mapping_combo("nds.hotkey.quit.pad");
   /* A saved duplicate must never execute two emulator actions. The menu is
    * reserved first, then fast-forward, followed by the remaining hotkeys. */
   remove_duplicate_hotkeys(&controls->hotkeys);
-  controls->fast_forward_toggle = !strcasecmp(
-      prefs_get_string("Wrapper/FastForwardMode", "hold"), "toggle");
-  controls->analog_touch_button = button_for_token(
-      prefs_get_string("Wrapper/AnalogTouchButton", "StickR"));
+  controls->fast_forward_toggle = launcher_mapping_is("fastforward.mode", "toggle");
+  controls->analog_touch_button = launcher_mapping_combo("nds.hotkey.pointer_click.pad");
   controls->stylus_speed = prefs_get_int("Wrapper/AnalogStylusSpeed", 8);
   if (controls->stylus_speed < 1) controls->stylus_speed = 1;
   if (controls->stylus_speed > 20) controls->stylus_speed = 20;
   controls->lua_rotation_sent = 360;
   controls->motion_sample_sent = 0;
   controls->motion_source_sent = -1;
+
+  char menu_mapping[256];
+  launcher_mapping_value("nds.hotkey.menu.pad", menu_mapping,
+                         sizeof(menu_mapping));
+  debug_logf("input menu mapping=%s mask=0x%llx",
+             menu_mapping[0] ? menu_mapping : "(unbound)",
+             (unsigned long long)controls->hotkeys.menu);
 }
 
 static int combo_held(u64 held, u64 combo) {
@@ -677,6 +851,7 @@ static int process_input(DrasticRuntimeConfig *config,
 
   if (menu && (pressed & DRASTIC_INPUT_HOTKEY_BIT(
                             DRASTIC_INPUT_HOTKEY_MENU))) {
+    debug_logf("input menu request accepted");
     drastic_input_sampler_update_runtime(sampler, config, false);
     return 1;
   }
@@ -846,11 +1021,22 @@ static void applet_lifecycle_hook(AppletHookType hook, void *parameter) {
   }
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+  debug_log_init(argc, argv);
+  debug_logf("stage=main-enter");
+  DrasticLaunchOptions launch;
+  parse_launch_options(&launch, argc, argv);
+  debug_logf("launch rom=%s return=%s return_to_nro=%d",
+             launch.rom_path, launch.return_nro, launch.return_to_nro);
+  if (!launch.rom_path[0])
+    fatal_error("启动器未提供 NDS ROM 路径。");
+  prefs_set_disc_path(launch.rom_path);
   cpu_boost(1);
   bool cpu_boost_active = true;
   setup_directories();
+  debug_logf("stage=directories-ready");
   prefs_init(PREFS_PATH);
+  debug_logf("stage=prefs-ready rom=%s", prefs_get_string("Drastic/RomPath", ""));
   /* Drastic builds mirrored ARM7/ARM9 address-space views from Android ashmem.
    * The Switch shim provides those aliases and the lazy 4 GiB fastmem window. */
   fastmem_set_mode(FASTMEM_MODE_ON);
@@ -858,14 +1044,18 @@ int main(void) {
 
   DrasticRuntimeConfig runtime;
   drastic_config_load(&runtime);
+  debug_logf("stage=config-loaded rom=%s core=%s", runtime.rom_path,
+             runtime.core_path);
   opensles_set_microphone_enabled(runtime.microphone_enabled != 0);
   opensles_set_microphone_source(
       runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
           ? OPENSLES_MIC_SOURCE_EXTERNAL
           : OPENSLES_MIC_SOURCE_SIMULATED);
   validate_inputs(&runtime);
+  debug_logf("stage=inputs-validated");
   check_jit_services();
   select_panel_size();
+  debug_logf("stage=surface-configured size=%dx%d", panel_width, panel_height);
 
   extern char *fake_heap_start;
   const size_t heap_mb = ((char *)heap_so_base - fake_heap_start) / (1024 * 1024);
@@ -875,6 +1065,7 @@ int main(void) {
 
   if (so_load(&emu_mod, runtime.core_path, heap_so_base, heap_so_limit) < 0)
     fatal_error("Could not load Drastic core:\n%s", runtime.core_path);
+  debug_logf("stage=core-loaded");
   update_imports();
   so_relocate(&emu_mod);
   so_resolve(&emu_mod, dynlib_functions, dynlib_numfunctions, 1);
@@ -890,6 +1081,7 @@ int main(void) {
   so_execute_init_array(&emu_mod);
   so_free_temp(&emu_mod);
   jni_init();
+  debug_logf("stage=jni-ready");
 
   void *clazz = jni_obj_new("com/dsemu/drastic/DraSticJNI");
   void *activity = jni_obj_new("com/dsemu/drastic/DraSticActivity");
@@ -906,15 +1098,18 @@ int main(void) {
   opensles_set_master_volume((unsigned)runtime.volume);
   core.setHingeStatus(fake_env, clazz, 0);
   core.setWhitenoiseFeed(fake_env, clazz, 0);
+  debug_logf("stage=core-initialized");
 
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
+  debug_logf("stage=renderer-init-begin");
   if (!drastic_renderer_init(&runtime)) {
     const char *renderer_error = drastic_renderer_last_error();
     if (renderer_error && renderer_error[0])
-      fatal_error("Could not initialize the OpenGL renderer:\n%s",
+      fatal_error("Could not initialize the Vulkan renderer:\n%s",
                   renderer_error);
-    fatal_error("Could not initialize the OpenGL renderer.");
+    fatal_error("Could not initialize the Vulkan renderer.");
   }
+  debug_logf("stage=renderer-ready");
   fatal_error_set_graphics_active(1);
   overlay_init(runtime.rotation);
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
@@ -936,6 +1131,7 @@ int main(void) {
 
   void *rom = jni_make_string(prepared_rom_path);
   const int rom_type = core.getRomType(fake_env, clazz, rom);
+  debug_logf("stage=rom-probed path=%s type=%d", prepared_rom_path, rom_type);
   if (rom_type <= 0)
     fatal_error("Drastic does not recognize this ROM:\n%s", runtime.rom_path);
 
@@ -1003,6 +1199,7 @@ int main(void) {
   if (game_thread_result != 0)
     fatal_error("Could not create the Drastic emulation thread (%d).",
                 game_thread_result);
+  debug_logf("stage=emulation-thread-started");
 
   DrasticInputSamplerConfig input_config;
   configure_input_sampler(&input_config, &controls, clazz);
@@ -1081,7 +1278,10 @@ int main(void) {
       update_runtime_hud(&hud, &runtime, &controls, 0);
       drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
                                overlay_frame(), false);
-      if (open_menu) drastic_menu_open(menu);
+      if (open_menu) {
+        debug_logf("menu open after transition frame");
+        drastic_menu_open(menu);
+      }
       svcSleepThread(16 * 1000 * 1000LL);
       continue;
     }
@@ -1109,7 +1309,10 @@ int main(void) {
     }
     /* Complete the waitScreen/renderFrame pair before pauseSystem() opens the
      * menu; the request is local to this frame and needs no persistent state. */
-    if (open_menu) drastic_menu_open(menu);
+    if (open_menu) {
+      debug_logf("menu open after gameplay frame");
+      drastic_menu_open(menu);
+    }
     boot_frames++;
   }
   if (lifecycle_hooked) {
@@ -1139,6 +1342,7 @@ int main(void) {
   pthr_finalize();
   libc_memory_shutdown();
   so_unload(&emu_mod);
+  configure_return_to_launcher(&launch);
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;

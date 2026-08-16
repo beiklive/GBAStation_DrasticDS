@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "drastic_rotation.h"
+#include "debug_log.h"
 #include "pthr.h"
 
 #define INPUT_SAMPLE_INTERVAL_NS UINT64_C(1000000)
@@ -247,6 +248,21 @@ static int combo_held(u64 held, u64 combo) {
   return combo && (held & combo) == combo;
 }
 
+static u64 virtual_stick_buttons(HidAnalogStickState left,
+                                 HidAnalogStickState right) {
+  const int threshold = 12000;
+  u64 buttons = 0;
+  if (left.y > threshold) buttons |= DRASTIC_INPUT_VIRTUAL_LEFT_UP;
+  if (left.y < -threshold) buttons |= DRASTIC_INPUT_VIRTUAL_LEFT_DOWN;
+  if (left.x < -threshold) buttons |= DRASTIC_INPUT_VIRTUAL_LEFT_LEFT;
+  if (left.x > threshold) buttons |= DRASTIC_INPUT_VIRTUAL_LEFT_RIGHT;
+  if (right.y > threshold) buttons |= DRASTIC_INPUT_VIRTUAL_RIGHT_UP;
+  if (right.y < -threshold) buttons |= DRASTIC_INPUT_VIRTUAL_RIGHT_DOWN;
+  if (right.x < -threshold) buttons |= DRASTIC_INPUT_VIRTUAL_RIGHT_LEFT;
+  if (right.x > threshold) buttons |= DRASTIC_INPUT_VIRTUAL_RIGHT_RIGHT;
+  return buttons;
+}
+
 static int map_buttons(const DrasticInputSampler *sampler, u64 held,
                        HidAnalogStickState left) {
   int buttons = 0;
@@ -297,9 +313,10 @@ static void *input_thread_main(void *opaque) {
 
   while (!__atomic_load_n(&sampler->stop, __ATOMIC_ACQUIRE)) {
     padUpdate(&sampler->pad);
-    const u64 held = padGetButtons(&sampler->pad);
     const HidAnalogStickState left = padGetStickPos(&sampler->pad, 0);
     const HidAnalogStickState right = padGetStickPos(&sampler->pad, 1);
+    const u64 held = padGetButtons(&sampler->pad) |
+        virtual_stick_buttons(left, right);
     const u32 style_set = padGetStyleSet(&sampler->pad);
     const u32 attributes = padGetAttributes(&sampler->pad);
     const u64 now = armGetSystemTick();
@@ -316,8 +333,13 @@ static void *input_thread_main(void *opaque) {
       const u64 combo = sampler->config.hotkeys[index];
       if (combo_held(held, combo)) {
         game_held &= ~combo;
-        if (!combo_held(previous_buttons, combo))
+        if (!combo_held(previous_buttons, combo)) {
           hotkeys_pressed |= DRASTIC_INPUT_HOTKEY_BIT(index);
+          if (index == DRASTIC_INPUT_HOTKEY_MENU)
+            debug_logf("input sampler menu hotkey held=0x%llx combo=0x%llx",
+                       (unsigned long long)held,
+                       (unsigned long long)combo);
+        }
       }
     }
 

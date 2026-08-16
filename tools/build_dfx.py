@@ -2,8 +2,8 @@
 """Build the Drastic Android post-FX programs for the Switch renderers.
 
 The original .dfx/.dsd files remain external build inputs from the user's APK.
-This tool emits a GLES source header and the two SMAA lookup textures into a
-temporary build directory.
+This tool emits a GLES source header, Vulkan SPIR-V modules, and the two SMAA
+lookup textures into a temporary build directory.
 """
 
 from __future__ import annotations
@@ -37,6 +37,11 @@ PROGRAMS = (
     ProgramSpec("smaa_weight", "SMAA.dfx", 1),
     ProgramSpec("smaa_blend", "SMAA.dfx", 2),
 )
+
+VULKAN_PROGRAMS = {
+    "scale2x", "hq2x", "fxaa", "fxaa_luma", "fxaa_hq",
+    "smaa_edge", "smaa_weight", "smaa_blend",
+}
 
 
 TAG_RE = re.compile(r"<(?P<tag>[A-Za-z0-9_]+)(?::[^>]*)?>(?P<body>.*?)</(?P=tag)>", re.S)
@@ -298,6 +303,9 @@ def main() -> int:
         vertex, fragment = sources[spec.name]
         validate_opengl(args.glslang, data_output, spec.name,
                         vertex, fragment)
+        if spec.name in VULKAN_PROGRAMS:
+            compile_vulkan(args.glslang, data_output, spec.name,
+                           vertex, fragment, sampler_map[spec.name])
 
     shutil.copyfile(args.source / "smaa" / "AreaTexRGB.raw",
                     data_output / "drastic_smaa_area_rgb.bin")

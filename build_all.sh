@@ -15,6 +15,7 @@ if [[ ! -d "$ASSETS" && -d "$APK_DIR/assets" ]]; then
   ASSETS="$APK_DIR/assets"
 fi
 DFX_SOURCE="$ASSETS/shaders"
+VULKAN_SDK=${NVK_SDK_DIR:-"$(dirname "$APP")/switchVK/nvk-switch-26.1.4"}
 
 required=(
   "$DFX_SOURCE/None.dfx"
@@ -42,7 +43,14 @@ required=(
   "$DFX_SOURCE/smaa/SearchTexRGB.raw"
 )
 for file in "${required[@]}"; do
-  [[ -f "$file" ]] || { echo "Missing OpenGL shader input: $file" >&2; exit 1; }
+  [[ -f "$file" ]] || { echo "Missing Vulkan shader input: $file" >&2; exit 1; }
+done
+for file in "$VULKAN_SDK/include/vulkan/vulkan.h" \
+            "$VULKAN_SDK/include/vulkan/vulkan_vi.h" \
+            "$VULKAN_SDK/lib/libvulkan.a" \
+            "$APP/source/shaders/drastic_vk.vert" \
+            "$APP/source/shaders/drastic_vk.frag"; do
+  [[ -f "$file" ]] || { echo "Missing Vulkan build input: $file" >&2; exit 1; }
 done
 
 PYTHON3=${PYTHON3:-$(command -v python3 || true)}
@@ -58,27 +66,38 @@ if [[ "$GLSLANG" != *.exe && -f "$GLSLANG.exe" ]]; then
   GLSLANG="$GLSLANG.exe"
 fi
 [[ -n "$GLSLANG" && -x "$GLSLANG" ]] || {
-  echo "glslangValidator is required to validate OpenGL shaders." >&2
+  echo "glslangValidator is required to compile Vulkan shaders." >&2
   exit 1
 }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/drasticds-gl.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/drasticds-vk.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 DFX_STAGE="$WORK/dfx"
 
 echo "==== clean previous output ===="
 make -C "$APP" clean >/dev/null
 
-echo "==== Drastic OpenGL post-FX programs ===="
+echo "==== Drastic Vulkan post-FX programs ===="
 "$PYTHON3" "$APP/tools/build_dfx.py" \
   --source "$DFX_SOURCE" --output "$DFX_STAGE" --glslang "$GLSLANG"
+"$GLSLANG" -V --target-env vulkan1.1 -Os \
+  "$APP/source/shaders/drastic_vk.vert" \
+  -o "$DFX_STAGE/data/drastic_vk_vert.bin"
+"$GLSLANG" -V --target-env vulkan1.1 -Os \
+  "$APP/source/shaders/drastic_vk.frag" \
+  -o "$DFX_STAGE/data/drastic_vk_frag.bin"
+"$PYTHON3" "$APP/tools/generate_vulkan_loader.py" \
+  --headers "$VULKAN_SDK/include/vulkan" \
+  --output "$DFX_STAGE/src/vulkan_loader.c" \
+  "$APP/source" "$APP/third_party/lsfg-vk"
 
-echo "==== standalone Drastic OpenGL host ===="
-make -C "$APP" -j"$JOBS" DFX_GENERATED="$DFX_STAGE"
+echo "==== standalone Drastic Vulkan host (switchVK NVK) ===="
+make -C "$APP" -j"$JOBS" DFX_GENERATED="$DFX_STAGE" \
+  VULKAN_SDK="$VULKAN_SDK"
 
 echo
 echo "Done. Copy this NRO to the SD card:"
-ls -la "$APP/GBAStationDrasticStub.nro"
-echo "Runtime ROM: sdmc:/nds/black.nds"
+ls -la "$APP/GBAStationNDSStub.nro"
+echo "Runtime ROM: supplied by the GBAStation launcher"
 echo "Runtime BIOS: sdmc:/GBAStation/bios/NDS/{bios7.bin,bios9.bin,firmware.bin}"
 echo "Runtime cheat database: sdmc:/GBAStation/cheats/usrcheat.dat"
