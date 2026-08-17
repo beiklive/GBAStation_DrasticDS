@@ -1,10 +1,12 @@
 #include "gamedb.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "debug_log.h"
 
@@ -13,7 +15,31 @@ static const char *const db_paths[] = {
   "/GBAStation/data/GameData_NDS.json",
 };
 
+static int temporary_path(const char *path, const char *suffix,
+                          char *out, size_t out_size) {
+  return path && suffix &&
+      snprintf(out, out_size, "%s%s", path, suffix) < (int)out_size;
+}
+
+/* A failure can only leave the primary path absent after it was moved to .bak.
+ * .tmp was fully fsync'd before that move, so it is the newest recoverable
+ * revision; .bak is the conservative fallback. */
+static void recover_database_file(const char *path) {
+  if (!path || !access(path, F_OK)) return;
+  char temporary[1100], backup[1100];
+  if (!temporary_path(path, ".tmp", temporary, sizeof(temporary)) ||
+      !temporary_path(path, ".bak", backup, sizeof(backup)))
+    return;
+  if (!access(temporary, F_OK) && !rename(temporary, path)) {
+    debug_logf("GameDB recovered pending transaction path=%s", path);
+    return;
+  }
+  if (!access(backup, F_OK) && !rename(backup, path))
+    debug_logf("GameDB recovered backup path=%s", path);
+}
+
 static char *read_text(const char *path, size_t *size) {
+  recover_database_file(path);
   FILE *file = fopen(path, "rb");
   if (!file) return NULL;
   if (fseek(file, 0, SEEK_END)) { fclose(file); return NULL; }
@@ -29,17 +55,45 @@ static char *read_text(const char *path, size_t *size) {
   return data;
 }
 
+static int sync_path(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (!file) return 0;
+  const int ok = fsync(fileno(file)) == 0;
+  fclose(file);
+  return ok;
+}
+
 static int write_text(const char *path, const char *data, size_t size) {
-  char temporary[1100];
-  snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+  char temporary[1100], backup[1100];
+  if (!temporary_path(path, ".tmp", temporary, sizeof(temporary)) ||
+      !temporary_path(path, ".bak", backup, sizeof(backup)))
+    return 0;
   FILE *file = fopen(temporary, "wb");
   if (!file) return 0;
-  int ok = fwrite(data, 1, size, file) == size && fflush(file) == 0;
+  int ok = fwrite(data, 1, size, file) == size && fflush(file) == 0 &&
+           fsync(fileno(file)) == 0;
   if (fclose(file) != 0) ok = 0;
   if (!ok) { remove(temporary); return 0; }
-  remove(path);
-  if (rename(temporary, path)) { remove(temporary); return 0; }
-  return 1;
+
+  /* Never delete the only good GameDB revision.  FAT does not reliably
+   * replace an existing destination with rename(), so move it aside first.
+   * If anything afterwards fails, startup recovery can restore either file. */
+  if (remove(backup) && errno != ENOENT) return 0;
+  int moved_current = 0;
+  if (rename(path, backup) == 0) {
+    moved_current = 1;
+  } else if (errno != ENOENT) {
+    return 0;
+  }
+  if (rename(temporary, path)) {
+    const int saved_errno = errno;
+    if (moved_current) (void)rename(backup, path);
+    errno = saved_errno;
+    return 0;
+  }
+  /* The previous revision remains as .bak deliberately.  It is cheap
+   * insurance against a power loss while the FAT metadata is being flushed. */
+  return sync_path(path);
 }
 
 static void normalize_path(char *path) {
@@ -349,6 +403,13 @@ int gamedb_session_started(const char *rom_path, int *play_count, int *play_time
   if (play_count) *play_count = count;
   if (play_time) *play_time = time;
   return patch_database(rom_path, 0, NULL, 0, &count, &time, NULL, NULL);
+}
+
+int gamedb_session_checkpoint(const char *rom_path, int play_count,
+                              int play_time) {
+  char timestamp[64]; now_string(timestamp, sizeof(timestamp));
+  return patch_database(rom_path, 0, NULL, 0, &play_count, &play_time,
+                        timestamp, NULL);
 }
 
 int gamedb_session_finished(const char *rom_path, int play_count, int play_time,

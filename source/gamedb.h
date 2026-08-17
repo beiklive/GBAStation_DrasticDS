@@ -12,6 +12,10 @@ int gamedb_get_save_path(const char *rom_path, char *out, size_t out_size);
 /* Writes only the matching GameData_NDS.json object and preserves every
  * launcher-owned field. All routines return non-zero on a successful write. */
 int gamedb_session_started(const char *rom_path, int *play_count, int *play_time);
+/* Records a running session without waiting for the potentially fragile core
+ * shutdown path. Call this periodically to bound data loss after a hard lock. */
+int gamedb_session_checkpoint(const char *rom_path, int play_count,
+                              int play_time);
 int gamedb_session_finished(const char *rom_path, int play_count, int play_time,
                             const char *screenshot_path);
 int gamedb_save_display_current(const char *rom_path,

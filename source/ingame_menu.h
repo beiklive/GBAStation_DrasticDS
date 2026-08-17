@@ -58,6 +58,8 @@ bool drastic_menu_is_open(const DrasticIngameMenu *menu);
 void drastic_menu_note_state_save(DrasticIngameMenu *menu, int slot);
 void drastic_menu_poll(DrasticIngameMenu *menu);
 void drastic_menu_apply_persisted_cheats(DrasticIngameMenu *menu);
+/* Called while libdrastic is still alive during a normal game exit. */
+void drastic_menu_clear_cheats_for_exit(DrasticIngameMenu *menu);
 void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
                          HidAnalogStickState left,
                          HidAnalogStickState right);

@@ -3,6 +3,7 @@
 #include <switch.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -48,6 +49,7 @@ typedef struct {
   char rom_path[1024];
   char return_nro[1024];
   int return_to_nro;
+  int debug_rom_fallback;
 } DrasticLaunchOptions;
 
 static int has_nro_extension(const char *path) {
@@ -77,6 +79,19 @@ static void parse_launch_options(DrasticLaunchOptions *options, int argc,
     if (!options->rom_path[0] && !has_nro_extension(argument))
       snprintf(options->rom_path, sizeof(options->rom_path), "%s", argument);
   }
+#ifdef DRASTIC_DEBUG_ROM_PATH
+  /* A debug build can be started directly from hbmenu/Ryujinx, where no
+   * launcher argv exists.  Explicit launcher arguments always win. */
+  if (!options->rom_path[0] && DRASTIC_DEBUG_ROM_PATH[0]) {
+    snprintf(options->rom_path, sizeof(options->rom_path), "%s",
+             DRASTIC_DEBUG_ROM_PATH);
+    options->debug_rom_fallback = 1;
+    /* This launch did not originate from GBAStation; do not schedule a
+     * nonexistent launcher on exit while debugging under hbmenu/Ryujinx. */
+    options->return_to_nro = 0;
+    options->return_nro[0] = '\0';
+  }
+#endif
 }
 
 static void configure_return_to_launcher(const DrasticLaunchOptions *options) {
@@ -381,7 +396,7 @@ static void validate_inputs(const DrasticRuntimeConfig *config) {
   char cheat_database[1024];
   configured_cheat_database_path(config, cheat_database, sizeof(cheat_database));
   if (!regular_file(cheat_database))
-    fatal_error("DraStic usrcheat.dat is missing from\n%s.", cheat_database);
+    debug_logf("cheats database unavailable (optional) path=%s", cheat_database);
   if (!regular_file(SYSTEM_DIR "/game_database.xml"))
     fatal_error("Drastic game_database.xml is missing from\n%s.", SYSTEM_DIR);
 }
@@ -517,6 +532,31 @@ static u64 buttons_for_combo(const char *combo) {
   return result;
 }
 
+/* A DS button can have several independent physical inputs.  In config.cfg
+ * those alternatives are written with `|`, for example
+ * PAD_LEFT|PAD_LEFTSTICKLEFT|PAD_RIGHTSTICKLEFT.  This is deliberately not
+ * the hotkey parser above: a hotkey is one chord (`+`) and its historic
+ * alternative syntax must remain a single chord for the input sampler. */
+static u64 buttons_for_binding(const char *mapping) {
+  if (!mapping || !*mapping || !strcasecmp(mapping, "None")) return 0;
+  char copy[192];
+  if (strlen(mapping) >= sizeof(copy)) return 0;
+  strcpy(copy, mapping);
+
+  u64 result = 0;
+  char *save = NULL;
+  for (char *token = strtok_r(copy, "|+", &save); token;
+       token = strtok_r(NULL, "|+", &save)) {
+    while (*token && isspace((unsigned char)*token)) token++;
+    char *end = token + strlen(token);
+    while (end > token && isspace((unsigned char)end[-1])) *--end = '\0';
+    const u64 button = button_for_token(token);
+    if (!button) return 0;
+    result |= button;
+  }
+  return result;
+}
+
 static int analog_dpad_enabled;
 static int analog_dpad_deadzone;
 
@@ -579,12 +619,26 @@ static u64 launcher_mapping_combo(const char *key) {
   return buttons_for_combo(value);
 }
 
+static u64 launcher_mapping_binding(const char *key) {
+  char value[256];
+  launcher_mapping_value(key, value, sizeof(value));
+  return buttons_for_binding(value);
+}
+
+static int is_ds_binding_key(const char *key) {
+  for (unsigned index = 0; index < sizeof(bindings) / sizeof(*bindings);
+       index++)
+    if (!strcmp(key, bindings[index].key)) return 1;
+  return 0;
+}
+
 static void debug_log_nds_mapping(const char *key) {
   char value[256];
   launcher_mapping_value(key, value, sizeof(value));
   debug_logf("input mapping key=%s value=%s mask=0x%llx", key,
              value[0] ? value : "(unbound)",
-             (unsigned long long)buttons_for_combo(value));
+             (unsigned long long)(is_ds_binding_key(key)
+                 ? buttons_for_binding(value) : buttons_for_combo(value)));
 }
 
 static void debug_log_all_nds_mappings(void) {
@@ -623,7 +677,7 @@ static int launcher_mapping_mentions_left_stick(const char *key) {
 
 static void load_bindings(void) {
   for (unsigned index = 0; index < sizeof(bindings) / sizeof(*bindings); index++)
-    bindings[index].switch_mask = launcher_mapping_combo(bindings[index].key);
+    bindings[index].switch_mask = launcher_mapping_binding(bindings[index].key);
   /* nds_stub accepts virtual left-stick direction tokens. Enable the sampler's
    * equivalent only when the shared mapping explicitly uses them. */
   analog_dpad_enabled =
@@ -1119,6 +1173,111 @@ static int has_archive_extension(const char *path) {
                        !strcasecmp(extension, ".rar"));
 }
 
+/* GameDB time records actual emulation time only.  Menu pause, applet
+ * suspend, loading transitions, and long stalled frames deliberately reset
+ * the interval instead of being charged to the player. */
+typedef struct {
+  u64 active_ticks;
+  u64 last_active_tick;
+  int active;
+} DrasticPlayTimeClock;
+
+static void play_time_pause(DrasticPlayTimeClock *clock) {
+  if (clock) clock->active = 0;
+}
+
+static void play_time_frame(DrasticPlayTimeClock *clock) {
+  if (!clock) return;
+  const u64 now = armGetSystemTick();
+  const u64 frequency = armGetSystemTickFreq();
+  if (clock->active && frequency) {
+    const u64 elapsed = now - clock->last_active_tick;
+    /* Match nds_stub's protection against suspend/debugger gaps. */
+    if (elapsed <= frequency * 5)
+      clock->active_ticks += elapsed;
+  }
+  clock->last_active_tick = now;
+  clock->active = 1;
+}
+
+static int play_time_seconds(int base_seconds,
+                             const DrasticPlayTimeClock *clock) {
+  const u64 frequency = armGetSystemTickFreq();
+  if (!clock || !frequency) return base_seconds;
+  const u64 seconds = clock->active_ticks / frequency;
+  const int64_t total = (int64_t)base_seconds +
+                        (seconds > INT32_MAX ? INT32_MAX : (int64_t)seconds);
+  return total > INT32_MAX ? INT32_MAX : (int)total;
+}
+
+static void render_exit_autosave_notice(const DrasticRuntimeConfig *runtime,
+                                        void *clazz, const char *message,
+                                        uint32_t color) {
+  if (!runtime || !message) return;
+  const int width = overlay_width();
+  const int height = overlay_height();
+  const int box_width = width > 720 ? 640 : width - 48;
+  const int box_height = 116;
+  const int x = (width - box_width) / 2;
+  const int y = (height - box_height) / 2;
+  overlay_begin();
+  overlay_fill_rect(0, 0, width, height, 0xb0000000u);
+  overlay_fill_rect(x, y, box_width, box_height, 0xf019222bu);
+  overlay_border_rect(x, y, box_width, box_height, 2, 0xff51bff5u);
+  overlay_draw_text_scaled(x + 28, y + 24, 2, color, message);
+  overlay_draw_text(x + 30, y + 82, 0xffb4c0ccu,
+                    "请勿关闭程序或返回启动器");
+  overlay_finish();
+  drastic_renderer_present(runtime, core.renderFrame, fake_env, clazz,
+                           overlay_frame(), false);
+}
+
+static void save_exit_state(const DrasticRuntimeConfig *runtime, void *clazz,
+                            DrasticIngameMenu *menu) {
+  /* This preference is imported from config.cfg's save.autoSaveOnExit.
+   * Keep the fallback disabled so a missing/shared configuration can never
+   * unexpectedly overwrite a user's selected state during shutdown. */
+  int configured_slot = prefs_get_int("Drastic/AutoSaveOnExit", 0);
+  if (configured_slot < 0) configured_slot = 0;
+  if (configured_slot > 10) configured_slot = 10;
+  if (!configured_slot || !core.saveState) {
+    debug_logf("exit autosave skipped slot=%d", configured_slot);
+    return;
+  }
+  const int slot = configured_slot - 1;
+  char notice[96];
+  snprintf(notice, sizeof(notice), "正在保存退出即时存档（槽位 %d）", slot);
+  debug_logf("exit autosave begin slot=%d", slot);
+  render_exit_autosave_notice(runtime, clazz, notice, 0xfff6fbffu);
+  /* Allow the notice to reach the display before the core's file operation. */
+  svcSleepThread(250 * 1000 * 1000LL);
+  const int requested = core.saveState(fake_env, clazz, slot, 1);
+  int completed = requested != 0;
+  if (requested && core.isSaving) {
+    const u64 frequency = armGetSystemTickFreq();
+    const u64 started = armGetSystemTick();
+    while (core.isSaving(fake_env, clazz)) {
+      if (frequency && armGetSystemTick() - started > frequency * 15) {
+        completed = 0;
+        debug_logf("exit autosave timeout slot=%d", slot);
+        break;
+      }
+      svcSleepThread(16 * 1000 * 1000LL);
+    }
+  }
+  if (completed) {
+    drastic_menu_note_state_save(menu, slot);
+    /* Produce the same standalone PNG thumbnail as manual and mapped saves. */
+    drastic_menu_poll(menu);
+  }
+  snprintf(notice, sizeof(notice), "%s",
+           completed ? "退出即时存档完成" : "退出即时存档失败，正在退出");
+  render_exit_autosave_notice(runtime, clazz, notice,
+                               completed ? 0xff63d6a5u : 0xffffbd6du);
+  svcSleepThread(450 * 1000 * 1000LL);
+  debug_logf("exit autosave %s slot=%d", completed ? "done" : "failed", slot);
+}
+
 static void shutdown_core(void *clazz, CoreGameThread *game) {
   if (!__atomic_load_n(&game->finished, __ATOMIC_ACQUIRE)) {
     /* Match DraSticEmuActivity.onPause() followed by its shutdown helper:
@@ -1207,8 +1366,9 @@ int main(int argc, char *argv[]) {
   debug_logf("stage=main-enter");
   DrasticLaunchOptions launch;
   parse_launch_options(&launch, argc, argv);
-  debug_logf("launch rom=%s return=%s return_to_nro=%d",
-             launch.rom_path, launch.return_nro, launch.return_to_nro);
+  debug_logf("launch rom=%s return=%s return_to_nro=%d source=%s",
+             launch.rom_path, launch.return_nro, launch.return_to_nro,
+             launch.debug_rom_fallback ? "debug-fallback" : "launcher");
   if (!launch.rom_path[0])
     fatal_error("启动器未提供 NDS ROM 路径。");
   prefs_set_disc_path(launch.rom_path);
@@ -1239,12 +1399,13 @@ int main(int argc, char *argv[]) {
   if (!make_directory_tree(runtime.save_path))
     fatal_error("Could not create the game save directory:\n%s",
                 runtime.save_path);
-  debug_logf("stage=config-loaded rom=%s core=%s save_path=%s raw_sav=1 ff_index=%d hires3d=%d cheats=%d",
+  debug_logf("stage=config-loaded rom=%s core=%s save_path=%s raw_sav=1 ff_index=%d hires3d=%d cheats=%d exit_autosave_slot=%d",
              runtime.rom_path, runtime.core_path,
              runtime.save_path[0] ? runtime.save_path : "(default)",
              prefs_get_int("Drastic/FastForwardSpeed", 5),
              1,
-             prefs_get_bool("Drastic/CheatsEnabled", true));
+             prefs_get_bool("Drastic/CheatsEnabled", true),
+             prefs_get_int("Drastic/AutoSaveOnExit", 0));
   opensles_set_microphone_enabled(runtime.microphone_enabled != 0);
   opensles_set_microphone_source(
       runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
@@ -1406,8 +1567,9 @@ int main(int argc, char *argv[]) {
   int game_play_count = 0;
   int game_play_time = 0;
   (void)gamedb_session_started(runtime.rom_path, &game_play_count,
-                               &game_play_time);
-  const u64 game_session_started = armGetSystemTick();
+                                &game_play_time);
+  DrasticPlayTimeClock game_play_clock = {0};
+  u64 game_last_checkpoint = armGetSystemTick();
 
   DrasticInputSamplerConfig input_config;
   configure_input_sampler(&input_config, &controls, clazz);
@@ -1442,7 +1604,23 @@ int main(int argc, char *argv[]) {
   while (!controls.exit_requested &&
          !__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
     if (!appletMainLoop()) break;
+    /* A total system lock cannot execute shutdown code.  Persist session
+     * metadata every minute while the host is still responsive, so only the
+     * tail of a session is at risk instead of the entire play-time update. */
+    const u64 checkpoint_now = armGetSystemTick();
+    const u64 checkpoint_frequency = armGetSystemTickFreq();
+    if (checkpoint_frequency &&
+        checkpoint_now - game_last_checkpoint >= checkpoint_frequency * 60) {
+      const int checkpoint_time = play_time_seconds(game_play_time,
+                                                    &game_play_clock);
+      const int checkpoint_ok = gamedb_session_checkpoint(
+          runtime.rom_path, game_play_count, checkpoint_time);
+      debug_logf("GameDB checkpoint %s play_time=%d",
+                 checkpoint_ok ? "saved" : "failed", checkpoint_time);
+      game_last_checkpoint = checkpoint_now;
+    }
     if (lifecycle.suspended) {
+      play_time_pause(&game_play_clock);
       svcSleepThread(16 * 1000 * 1000LL);
       continue;
     }
@@ -1453,6 +1631,7 @@ int main(int argc, char *argv[]) {
     }
     drastic_menu_poll(menu);
     if (drastic_menu_is_open(menu)) {
+      play_time_pause(&game_play_clock);
       reset_runtime_fps_window(&hud);
       drastic_input_sampler_update_runtime(input_sampler, &runtime, false);
       DrasticInputSnapshot input;
@@ -1483,6 +1662,7 @@ int main(int argc, char *argv[]) {
                                : 0;
     const unsigned transition_state = (unsigned)frame_info & 0xffffu;
     if (transition_state != 0) {
+      play_time_pause(&game_play_clock);
       const int open_menu = process_input(
           &runtime, &controls, clazz, menu, input_sampler);
       update_runtime_hud(&hud, &runtime, &controls, 0);
@@ -1502,7 +1682,9 @@ int main(int argc, char *argv[]) {
         &runtime, &controls, clazz, menu, input_sampler);
     if (controls.exit_requested) break;
     const bool presentation_acquired = drastic_renderer_acquire_next_frame();
+#ifdef USE_VULKAN
     pthr_capture_next_cond_wait_as_frame_sync();
+#endif
     core.waitScreen(fake_env, clazz);
     if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
       if (presentation_acquired)
@@ -1510,7 +1692,19 @@ int main(int argc, char *argv[]) {
                                  overlay_frame(), false);
       break;
     }
+    /* A completed waitScreen is the precise DraStic emulation-frame boundary.
+     * Count wall time between these boundaries only while the game is active. */
+    play_time_frame(&game_play_clock);
+#ifdef USE_VULKAN
+    /* The Vulkan host captures DraStic's GLES upload bridge.  Only consume a
+     * core frame after that bridge reported a fresh upload. */
     const int core_frame_ready = pthr_take_frame_sync_ready();
+#else
+    /* EGL is DraStic's native renderer path: waitScreen() itself is the frame
+     * boundary.  The Vulkan capture latch never fires here, so using it would
+     * leave the OpenGL textures frozen at normal frame pacing. */
+    const int core_frame_ready = 1;
+#endif
     update_runtime_hud(&hud, &runtime, &controls, core_frame_ready);
     drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
                              overlay_frame(), core_frame_ready);
@@ -1543,13 +1737,23 @@ int main(int argc, char *argv[]) {
   if (boot_frames == 0 &&
       __atomic_load_n(&game.finished, __ATOMIC_ACQUIRE) && !game.result)
     fatal_error("Drastic could not start:\n%s", runtime.rom_path);
+  /* Keep the core alive until every cheat belonging to this game has been
+   * disabled.  This also makes a normal launcher return leave no enabled
+   * cheat state behind in DraStic's in-memory lists. */
+  if (core.pauseSystem)
+    core.pauseSystem(fake_env, clazz, 1);
+  /* This is intentionally before cheat/core teardown: saveState needs the
+   * fully initialized core and its worker threads to remain alive.  Pausing
+   * first gives the exit state the same consistent boundary as a menu save. */
+  if (!__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE))
+    save_exit_state(&runtime, clazz, menu);
+  debug_logf("shutdown stage=cheats-begin");
+  drastic_menu_clear_cheats_for_exit(menu);
+  debug_logf("shutdown stage=cheats-done");
   prefs_set_int("Wrapper/StateSlot", controls.state_slot);
   prefs_save();
 
-  const u64 session_frequency = armGetSystemTickFreq();
-  const u64 session_ticks = armGetSystemTick() - game_session_started;
-  if (session_frequency)
-    game_play_time += (int)(session_ticks / session_frequency);
+  game_play_time = play_time_seconds(game_play_time, &game_play_clock);
   (void)gamedb_session_finished(runtime.rom_path, game_play_count,
                                  game_play_time,
                                  runtime.save_path[0] ? runtime.save_path : SCREENSHOTS_DIR);

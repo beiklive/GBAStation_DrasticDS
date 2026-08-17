@@ -62,6 +62,18 @@ typedef struct {
   int code_word_count;
 } MenuCheat;
 
+/* This mirrors the nds_stub picker model: the list is directory sized rather
+ * than capped at an arbitrary UI limit.  The parent entry is virtual, so it
+ * also works consistently for both sdmc:/ and / paths. */
+typedef struct {
+  char *name;
+  char *path;
+  char modified_time[32];
+  uint64_t size;
+  unsigned char is_directory;
+  unsigned char is_parent;
+} OverlayFileEntry;
+
 struct DrasticIngameMenu {
   DrasticRuntimeConfig *config;
   DrasticMenuCore core;
@@ -100,9 +112,9 @@ struct DrasticIngameMenu {
   int filter_picker_index;
   int filter_picker_custom;
   int filter_picker_valid;
-  char overlay_files[64][1024];
-  unsigned char overlay_file_is_directory[64];
+  OverlayFileEntry *overlay_files;
   int overlay_file_count;
+  int overlay_file_capacity;
   int overlay_picker_index;
   char overlay_picker_directory[1024];
   int overlay_preview_visible;
@@ -567,35 +579,45 @@ static int enabled_list_contains(const char *list, int wanted) {
 void drastic_menu_apply_persisted_cheats(DrasticIngameMenu *menu) {
   if (!menu || menu->persisted_cheats_applied) return;
   menu->persisted_cheats_applied = 1;
+  /* A game session must never inherit cheats from a previous run.  In
+   * particular, DraStic keeps its in-memory database list alive longer than
+   * our menu cache, so clear both it and the separately owned custom list. */
   clear_stale_custom_cheats(menu);
-  if (!prefs_contains("Wrapper/EnabledDatabaseCheats")) return;
-  const char *enabled = prefs_get_string("Wrapper/EnabledDatabaseCheats", "");
   const int count = clamp_int(
       menu->core.get_cheat_count
           ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0,
       0, MENU_CHEAT_LIMIT);
-  debug_logf("cheats restore core_count=%d enabled=%s", count, enabled);
   if (count > 0 && menu->core.set_cheat_enabled) {
     for (int index = 0; index < count; index++)
-      menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz, index,
-                                   enabled_list_contains(enabled, index));
-  } else {
-    /* This core build exposes the custom-cheat JNI API but does not populate
-     * its database list.  Inject the R4 records selected in our menu instead
-     * of treating their parsed indices as nonexistent core indices. */
-    refresh_cheats(menu);
-    int injected = 0;
-    for (int index = 0; index < menu->cheat_count; index++) {
-      MenuCheat *cheat = &menu->cheats[index];
-      if (!cheat->is_category && cheat->enabled &&
-          set_database_cheat_enabled(menu, cheat, 1))
-        injected++;
-    }
-    debug_logf("cheats restore injected=%d parsed=%d", injected,
-               menu->cheat_count);
+      menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz, index, 0);
   }
+  /* Drop legacy persisted selections as well.  During this session the menu
+   * can still update the key for its own bookkeeping, but every new launch
+   * overwrites it with the empty set before emulation begins. */
+  save_string("Wrapper/EnabledDatabaseCheats", "hex:");
+  debug_logf("cheats startup reset core_count=%d custom=cleared", count);
   if (menu->core.update_cheats)
     menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
+}
+
+void drastic_menu_clear_cheats_for_exit(DrasticIngameMenu *menu) {
+  if (!menu) return;
+  const int count = clamp_int(
+      menu->core.get_cheat_count
+          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0,
+      0, MENU_CHEAT_LIMIT);
+  if (count > 0 && menu->core.set_cheat_enabled) {
+    for (int index = 0; index < count; index++)
+      menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz, index, 0);
+  }
+  /* Custom records are per running core instance.  Clearing them is required
+   * because the core can retain an injected record after its visible menu
+   * entry is gone. */
+  clear_stale_custom_cheats(menu);
+  save_string("Wrapper/EnabledDatabaseCheats", "hex:");
+  if (menu->core.update_cheats)
+    menu->core.update_cheats(menu->core.env, menu->core.clazz, 1);
+  debug_logf("cheats exit reset core_count=%d custom=cleared", count);
 }
 
 static void persist_database_cheats(DrasticIngameMenu *menu) {
@@ -668,7 +690,9 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
       !strcmp(menu->cheats_database_path, path))
     return;
   free_cheats(menu);
-  menu->cheats_loaded = 1;
+  /* Only cache a successfully parsed list.  If usrcheat.dat is restored
+   * while the game is running, the next tab focus must be able to retry. */
+  menu->cheats_loaded = 0;
   snprintf(menu->cheats_rom_path, sizeof(menu->cheats_rom_path), "%s",
            menu->config->rom_path);
   snprintf(menu->cheats_database_path, sizeof(menu->cheats_database_path),
@@ -679,7 +703,7 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
   if (!file || !rom || fread(rom_header, 1, sizeof(rom_header), rom) != sizeof(rom_header)) {
     if (file) fclose(file);
     if (rom) fclose(rom);
-    set_status(menu, "无法读取 usrcheat.dat 或 ROM 信息"); return;
+    set_status(menu, "未找到 usrcheat.dat，金手指功能不可用"); return;
   }
   fclose(rom);
   if (fseek(file, 0, SEEK_END)) { fclose(file); return; }
@@ -717,6 +741,14 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
   if (!menu->cheats) { free(data); set_status(menu, "金手指内存不足"); return; }
   int stack_index[32], stack_remaining[32], stack_size = 0;
   int code_index = 0;
+  /* The core's Java cheat list can be shorter than usrcheat.dat's list for
+   * the same title.  getCheatEnabled() does not validate its index and an
+   * out-of-range call faults inside libdrastic, so never query it blindly. */
+  const int core_cheat_count = clamp_int(
+      menu->core.get_cheat_count
+          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0,
+      0, MENU_CHEAT_LIMIT);
+  int database_entries_outside_core = 0;
   for (uint32_t item = 0; item < item_count && pos + 4 <= size &&
                           menu->cheat_count < MENU_CHEAT_LIMIT; item++) {
     const uint32_t flags = cheat_le32(data + pos); pos += 4;
@@ -757,9 +789,9 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
       if (!entry->code_words) { menu->cheat_count--; break; }
       for (uint32_t word = 0; word < words; word++)
         entry->code_words[word] = (int32_t)cheat_le32(data + pos + word * 4);
-      const int core_count = menu->core.get_cheat_count
-          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0;
-      entry->enabled = core_count > 0 && menu->core.get_cheat_enabled
+      if (entry->index >= core_cheat_count) database_entries_outside_core++;
+      entry->enabled = entry->index >= 0 && entry->index < core_cheat_count &&
+                       menu->core.get_cheat_enabled
           ? menu->core.get_cheat_enabled(menu->core.env, menu->core.clazz,
                                          entry->index)
           : enabled_list_contains(
@@ -774,11 +806,9 @@ static void refresh_cheats(DrasticIngameMenu *menu) {
   }
   free(data);
   if (!menu->cheat_count) { free_cheats(menu); set_status(menu, "当前游戏没有可用金手指"); }
-  debug_logf("cheats database=%s parsed=%d core_count=%d", path,
-             menu->cheat_count,
-             menu->core.get_cheat_count
-                 ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz)
-                 : -1);
+  else menu->cheats_loaded = 1;
+  debug_logf("cheats database=%s parsed=%d core_count=%d outside_core=%d", path,
+             menu->cheat_count, core_cheat_count, database_entries_outside_core);
   menu->selection[MENU_CHEATS] = 0;
   menu->redraw = 1;
 }
@@ -790,9 +820,12 @@ static void refresh_snapshot(DrasticIngameMenu *menu) {
 static int set_database_cheat_enabled(DrasticIngameMenu *menu,
                                       MenuCheat *cheat, int enabled) {
   if (!menu || !cheat || cheat->is_category) return 0;
-  const int core_count = menu->core.get_cheat_count
-      ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0;
-  if (core_count > 0 && menu->core.set_cheat_enabled) {
+  const int core_count = clamp_int(
+      menu->core.get_cheat_count
+          ? menu->core.get_cheat_count(menu->core.env, menu->core.clazz) : 0,
+      0, MENU_CHEAT_LIMIT);
+  if (cheat->index >= 0 && cheat->index < core_count &&
+      menu->core.set_cheat_enabled) {
     menu->core.set_cheat_enabled(menu->core.env, menu->core.clazz,
                                  cheat->index, enabled);
     cheat->enabled = enabled;
@@ -1430,63 +1463,186 @@ static void render_filter_picker(DrasticIngameMenu *menu) {
 
 static int has_png_extension(const char *name) {
   const char *extension = name ? strrchr(name, '.') : NULL;
-  return extension && (!strcmp(extension, ".png") || !strcmp(extension, ".PNG"));
+  return extension && strlen(extension) == 4 &&
+      tolower((unsigned char)extension[1]) == 'p' &&
+      tolower((unsigned char)extension[2]) == 'n' &&
+      tolower((unsigned char)extension[3]) == 'g';
 }
 
-static void add_overlay_file(DrasticIngameMenu *menu, const char *path,
-                             int is_directory) {
-  if (!path || !path[0] || menu->overlay_file_count >= 64) return;
-  for (int index = 0; index < menu->overlay_file_count; index++)
-    if (!strcmp(menu->overlay_files[index], path)) return;
-  const int index = menu->overlay_file_count++;
-  snprintf(menu->overlay_files[index],
-            sizeof(menu->overlay_files[0]), "%s", path);
-  menu->overlay_file_is_directory[index] = is_directory != 0;
+static char *menu_strdup(const char *value) {
+  if (!value) return NULL;
+  const size_t length = strlen(value) + 1;
+  char *copy = malloc(length);
+  if (copy) memcpy(copy, value, length);
+  return copy;
 }
 
-static void refresh_overlay_files_in_directory(DrasticIngameMenu *menu,
-                                               const char *directory) {
+static void clear_overlay_files(DrasticIngameMenu *menu) {
+  for (int index = 0; index < menu->overlay_file_count; index++) {
+    free(menu->overlay_files[index].name);
+    free(menu->overlay_files[index].path);
+  }
+  free(menu->overlay_files);
+  menu->overlay_files = NULL;
   menu->overlay_file_count = 0;
+  menu->overlay_file_capacity = 0;
+}
+
+static int ensure_overlay_file_capacity(DrasticIngameMenu *menu) {
+  if (menu->overlay_file_count < menu->overlay_file_capacity) return 1;
+  const int capacity = menu->overlay_file_capacity
+      ? menu->overlay_file_capacity * 2 : 64;
+  OverlayFileEntry *files = realloc(menu->overlay_files,
+                                    (size_t)capacity * sizeof(*files));
+  if (!files) return 0;
+  menu->overlay_files = files;
+  menu->overlay_file_capacity = capacity;
+  return 1;
+}
+
+static void format_overlay_file_time(time_t timestamp, char *output,
+                                     size_t output_size) {
+  if (!output || !output_size) return;
+  output[0] = '\0';
+  if (timestamp <= 0) return;
+  struct tm *local = localtime(&timestamp);
+  if (local) strftime(output, output_size, "%Y-%m-%d %H:%M", local);
+}
+
+static int add_overlay_file(DrasticIngameMenu *menu, const char *name,
+                            const char *path, int is_directory, int is_parent,
+                            const struct stat *info) {
+  if (!name || !name[0] || !path || !path[0] ||
+      !ensure_overlay_file_capacity(menu)) return 0;
+  OverlayFileEntry *entry = &menu->overlay_files[menu->overlay_file_count];
+  memset(entry, 0, sizeof(*entry));
+  entry->name = menu_strdup(name);
+  entry->path = menu_strdup(path);
+  if (!entry->name || !entry->path) {
+    free(entry->name);
+    free(entry->path);
+    memset(entry, 0, sizeof(*entry));
+    return 0;
+  }
+  entry->is_directory = is_directory != 0;
+  entry->is_parent = is_parent != 0;
+  if (info) {
+    entry->size = info->st_size > 0 ? (uint64_t)info->st_size : 0;
+    format_overlay_file_time(info->st_mtime, entry->modified_time,
+                             sizeof(entry->modified_time));
+  }
+  menu->overlay_file_count++;
+  return 1;
+}
+
+static int overlay_parent_directory(const char *directory, char *parent,
+                                    size_t parent_size) {
+  if (!directory || !directory[0] || !parent || !parent_size) return 0;
+  char path[1024];
+  snprintf(path, sizeof(path), "%s", directory);
+  size_t length = strlen(path);
+  while (length > 1 && path[length - 1] == '/') path[--length] = '\0';
+  if (!strcmp(path, "/") || !strcmp(path, "sdmc:") || !strcmp(path, "sdmc:/"))
+    return 0;
+  char *slash = strrchr(path, '/');
+  if (!slash) return 0;
+  /* sdmc:/foo must return to sdmc:/, never the invalid sdmc: path. */
+  if (!strncmp(path, "sdmc:/", 6) && slash == path + 5) {
+    snprintf(parent, parent_size, "sdmc:/");
+    return 1;
+  }
+  if (slash == path) {
+    snprintf(parent, parent_size, "/");
+    return 1;
+  }
+  *slash = '\0';
+  snprintf(parent, parent_size, "%s", path);
+  return parent[0] != '\0';
+}
+
+static int overlay_file_compare(const void *left, const void *right) {
+  const OverlayFileEntry *a = left;
+  const OverlayFileEntry *b = right;
+  if (a->is_parent != b->is_parent) return a->is_parent ? -1 : 1;
+  if (a->is_directory != b->is_directory)
+    return a->is_directory ? -1 : 1;
+  const unsigned char *a_name = (const unsigned char *)a->name;
+  const unsigned char *b_name = (const unsigned char *)b->name;
+  while (*a_name && *b_name) {
+    const int delta = tolower(*a_name) - tolower(*b_name);
+    if (delta) return delta;
+    a_name++;
+    b_name++;
+  }
+  return tolower(*a_name) - tolower(*b_name);
+}
+
+static int refresh_overlay_files_in_directory(DrasticIngameMenu *menu,
+                                              const char *directory,
+                                              const char *focus_path) {
+  clear_overlay_files(menu);
+  overlay_preview_clear();
+  menu->overlay_preview_visible = 0;
   menu->overlay_picker_index = 0;
+  menu->scroll[MENU_OVERLAY_PICKER] = 0;
   snprintf(menu->overlay_picker_directory, sizeof(menu->overlay_picker_directory),
            "%s", directory ? directory : "sdmc:/GBAStation/overlays");
   char parent[1024];
-  snprintf(parent, sizeof(parent), "%s", menu->overlay_picker_directory);
-  char *slash = strrchr(parent, '/');
-  if (slash && slash != parent) {
-    *slash = '\0';
-    add_overlay_file(menu, parent, 1);
-  }
-  DIR *dir = opendir(directory);
-  if (!dir) return;
+  if (overlay_parent_directory(menu->overlay_picker_directory, parent,
+                               sizeof(parent)))
+    (void)add_overlay_file(menu, "..", parent, 1, 1, NULL);
+  DIR *dir = opendir(menu->overlay_picker_directory);
+  if (!dir) return 0;
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+    snprintf(path, sizeof(path), "%s%s%s", menu->overlay_picker_directory,
+             menu->overlay_picker_directory[strlen(menu->overlay_picker_directory) - 1] == '/'
+                 ? "" : "/", entry->d_name);
     struct stat info;
     if (!stat(path, &info) && S_ISDIR(info.st_mode))
-      add_overlay_file(menu, path, 1);
+      (void)add_overlay_file(menu, entry->d_name, path, 1, 0, &info);
     else if (has_png_extension(entry->d_name))
-      add_overlay_file(menu, path, 0);
+      (void)add_overlay_file(menu, entry->d_name, path, 0, 0, &info);
   }
   closedir(dir);
+  qsort(menu->overlay_files, (size_t)menu->overlay_file_count,
+        sizeof(*menu->overlay_files), overlay_file_compare);
+  if (focus_path && focus_path[0]) {
+    for (int index = 0; index < menu->overlay_file_count; index++) {
+      if (!strcmp(menu->overlay_files[index].path, focus_path)) {
+        menu->overlay_picker_index = index;
+        break;
+      }
+    }
+  }
+  return 1;
 }
 
 static void refresh_overlay_files(DrasticIngameMenu *menu) {
   const char *directory = menu->overlay_picker_directory[0]
       ? menu->overlay_picker_directory : "sdmc:/GBAStation/overlays";
-  refresh_overlay_files_in_directory(menu, directory);
-  if (!menu->overlay_file_count && !strcmp(directory, "sdmc:/GBAStation/overlays"))
-    refresh_overlay_files_in_directory(menu, "/GBAStation/overlays");
-  for (int index = 0; index < menu->overlay_file_count; index++)
-    if (!strcmp(menu->overlay_files[index], menu->config->overlay_path))
-      menu->overlay_picker_index = index;
+  const int opened = refresh_overlay_files_in_directory(menu, directory,
+                                                        menu->config->overlay_path);
+  if (!opened && !strcmp(directory, "sdmc:/GBAStation/overlays"))
+    refresh_overlay_files_in_directory(menu, "/GBAStation/overlays",
+                                       menu->config->overlay_path);
 }
 
 static const char *file_basename(const char *path) {
   const char *slash = path ? strrchr(path, '/') : NULL;
   return slash ? slash + 1 : (path ? path : "");
+}
+
+static void format_overlay_file_size(uint64_t size, char *output,
+                                     size_t output_size) {
+  if (size >= 1024ULL * 1024ULL)
+    snprintf(output, output_size, "%.1f MB", (double)size / (1024.0 * 1024.0));
+  else if (size >= 1024ULL)
+    snprintf(output, output_size, "%.1f KB", (double)size / 1024.0);
+  else
+    snprintf(output, output_size, "%llu B", (unsigned long long)size);
 }
 
 static void render_overlay_sidebar(DrasticIngameMenu *menu) {
@@ -1533,9 +1689,16 @@ static void render_overlay_picker(DrasticIngameMenu *menu) {
   overlay_fill_rect(0, 0, screen_width, screen_height, 0x30000000u);
   overlay_fill_rect(x, y, width, height, 0xd019222bu);
   overlay_border_rect(x, y, width, height, 2, COLOR_ACCENT);
-  overlay_draw_text_scaled(x + 28, y + 22, 2, COLOR_TEXT, "选择 PNG 遮罩");
-  overlay_draw_text_right(x + width - 28, y + 28, COLOR_MUTED,
-                          "A 打开/应用   X 预览   B 返回");
+  overlay_draw_text_scaled(x + 28, y + 18, 2, COLOR_TEXT, "选择 PNG 遮罩");
+  overlay_draw_text_clipped(x + 28, y + 48, width - 230, COLOR_MUTED,
+                            menu->overlay_picker_directory);
+  char count[64];
+  snprintf(count, sizeof(count), "%d / %d", menu->overlay_file_count ?
+               menu->overlay_picker_index + 1 : 0, menu->overlay_file_count);
+  overlay_draw_text_right(x + width - 28, y + 28, COLOR_MUTED, count);
+  overlay_draw_text_right(x + width - 28, y + 52, COLOR_MUTED,
+                          menu->overlay_preview_visible ? "A / B / X 关闭预览"
+                                                      : "A 选择   X 预览   B 返回");
   overlay_fill_rect(x + 24, y + 66, width - 48, 1, 0x33ffffffu);
   const int list_x = x + 24;
   const int list_y = y + 86;
@@ -1546,7 +1709,8 @@ static void render_overlay_picker(DrasticIngameMenu *menu) {
     draw_status(menu);
     return;
   }
-  const int visible = clamp_int((height - 130) / 52, 4, 11);
+  const int row_height = 62;
+  const int visible = clamp_int((height - 130) / row_height, 4, 10);
   int scroll = menu->scroll[MENU_OVERLAY_PICKER];
   if (menu->overlay_picker_index < scroll) scroll = menu->overlay_picker_index;
   if (menu->overlay_picker_index >= scroll + visible)
@@ -1556,17 +1720,31 @@ static void render_overlay_picker(DrasticIngameMenu *menu) {
   menu->scroll[MENU_OVERLAY_PICKER] = scroll;
   for (int row = 0; row < visible && scroll + row < menu->overlay_file_count; row++) {
     const int item = scroll + row;
-    draw_row(list_x, list_y + row * 52, list_width,
-             item == menu->overlay_picker_index,
-             file_basename(menu->overlay_files[item]),
-             menu->overlay_file_is_directory[item] ? "文件夹" :
-             !strcmp(menu->overlay_files[item], menu->config->overlay_path)
-                 ? "当前" : "PNG", 1);
+    const OverlayFileEntry *entry = &menu->overlay_files[item];
+    const int row_y = list_y + row * row_height;
+    const int focused = item == menu->overlay_picker_index;
+    overlay_fill_rect(list_x, row_y, list_width, row_height - 4,
+                      focused ? COLOR_SELECTED : COLOR_PANEL_ALT);
+    if (focused) overlay_border_rect(list_x, row_y, list_width, row_height - 4,
+                                     1, COLOR_ACCENT);
+    overlay_draw_nintendo_glyph(list_x + 20, row_y + 14, 28,
+                                entry->is_directory ? COLOR_ACCENT : COLOR_GOOD,
+                                entry->is_directory ? 0xE2C7 : 0xE3F4);
+    overlay_draw_text_clipped(list_x + 62, row_y + 10, list_width - 82,
+                              focused ? COLOR_TEXT : COLOR_MUTED, entry->name);
+    char size[40], meta[96];
+    format_overlay_file_size(entry->size, size, sizeof(size));
+    snprintf(meta, sizeof(meta), "%s%s%s", entry->is_parent ? "上级目录" :
+             entry->is_directory ? "文件夹" : size,
+             entry->is_directory || !entry->modified_time[0] ? "" : "   ",
+             entry->is_directory ? "" : entry->modified_time);
+    overlay_draw_text_clipped(list_x + 62, row_y + 34, list_width - 82,
+                              COLOR_MUTED, meta);
   }
   const int preview_item = clamp_int(menu->overlay_picker_index, 0,
                                      menu->overlay_file_count - 1);
   if (menu->overlay_preview_visible &&
-      !menu->overlay_file_is_directory[preview_item]) {
+      !menu->overlay_files[preview_item].is_directory) {
     const int preview_width = clamp_int(width - 160, 280, 520);
     const int preview_height = preview_width * 9 / 16;
     const int preview_x = x + (width - preview_width) / 2;
@@ -1576,8 +1754,8 @@ static void render_overlay_picker(DrasticIngameMenu *menu) {
     overlay_border_rect(preview_x - 10, preview_y - 42, preview_width + 20,
                         preview_height + 52, 2, COLOR_ACCENT);
     overlay_draw_text_clipped(preview_x, preview_y - 28, preview_width,
-                              COLOR_TEXT, file_basename(menu->overlay_files[preview_item]));
-    if (!overlay_draw_png_preview(menu->overlay_files[preview_item], preview_x,
+                              COLOR_TEXT, menu->overlay_files[preview_item].name);
+    if (!overlay_draw_png_preview(menu->overlay_files[preview_item].path, preview_x,
                                   preview_y, preview_width, preview_height))
       overlay_draw_text(preview_x + 16, preview_y + preview_height / 2,
                         COLOR_WARN, "无法预览该 PNG 文件");
@@ -1585,32 +1763,50 @@ static void render_overlay_picker(DrasticIngameMenu *menu) {
   draw_status(menu);
 }
 
+enum {
+  DISPLAY_LAYOUT_ROW = 0,
+  DISPLAY_CUSTOM_LAYOUT_ROW,
+  DISPLAY_GAP_ROW,
+  DISPLAY_INTEGER_SCALE_ROW,
+  DISPLAY_ROTATION_ROW,
+#ifdef USE_VULKAN
+  DISPLAY_LSFG_ROW,
+#endif
+  DISPLAY_OVERLAY_ROW,
+  DISPLAY_CUSTOM_FILTER_ROW,
+  DISPLAY_SYNC_ROW,
+  DISPLAY_ITEM_COUNT = DISPLAY_SYNC_ROW + 3,
+};
+
 static void render_display(DrasticIngameMenu *menu) {
   static const char *labels[] = {
     "画面布局", "自定义画面布局", "屏幕间距", "整数倍缩放", "画面方向",
-    "帧生成（Lossless）", "内置滤镜", "遮罩设置", "自定义滤镜（即将推出）",
+#ifdef USE_VULKAN
+    "帧生成（Lossless）",
+#endif
+    "遮罩设置", "自定义滤镜（即将推出）",
     "同步画面设置", "同步遮罩设置", "同步着色器设置"
   };
-  char values[12][112] = {{0}};
+  char values[DISPLAY_ITEM_COUNT][112] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%s", layout_label(menu->config->layout));
   snprintf(values[1], sizeof(values[1]), "编辑");
   snprintf(values[2], sizeof(values[2]), "%d px", menu->config->screen_gap);
   snprintf(values[4], sizeof(values[4]), "%d 度", (menu->config->rotation & 3) * 90);
-  snprintf(values[6], sizeof(values[6]), "%s",
-           filter_label(menu->config->video_filter));
+ #ifdef USE_VULKAN
   const int lsfg_allowed = prefs_get_bool("Wrapper/LSFGAllowed", false);
   if (!lsfg_allowed)
-    snprintf(values[5], sizeof(values[5]), "由启动器关闭");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "由启动器关闭");
   else if (!drastic_renderer_lsfg_dll_available())
-    snprintf(values[5], sizeof(values[5]), "缺少 Lossless.dll");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "缺少 Lossless.dll");
   else if (drastic_renderer_lsfg_enabled())
-    snprintf(values[5], sizeof(values[5]), "开");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "开");
   else if (drastic_renderer_lsfg_available())
-    snprintf(values[5], sizeof(values[5]), "关");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "关");
   else if (prefs_get_bool("Wrapper/LSFGEnabled", false))
-    snprintf(values[5], sizeof(values[5]), "不可用");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "不可用");
   else
-    snprintf(values[5], sizeof(values[5]), "关（重启后可开启）");
+    snprintf(values[DISPLAY_LSFG_ROW], sizeof(values[DISPLAY_LSFG_ROW]), "关（重启后可开启）");
+ #endif
   draw_shell(menu, "画面设置",
               "左右 调整   A 选择   B 返回");
   const int panel_x = menu_content_x();
@@ -1620,14 +1816,14 @@ static void render_display(DrasticIngameMenu *menu) {
   const int selected_index = menu->selection[MENU_DISPLAY];
   if (selected_index < scroll) scroll = selected_index;
   if (selected_index >= scroll + visible) scroll = selected_index - visible + 1;
-  scroll = clamp_int(scroll, 0, 12 > visible ? 12 - visible : 0);
+  scroll = clamp_int(scroll, 0, DISPLAY_ITEM_COUNT > visible ? DISPLAY_ITEM_COUNT - visible : 0);
   menu->scroll[MENU_DISPLAY] = scroll;
   int row_y = menu_content_y() + 58;
-  for (int row = 0; row < visible && scroll + row < 12; row++) {
+  for (int row = 0; row < visible && scroll + row < DISPLAY_ITEM_COUNT; row++) {
     const int index = scroll + row;
     const char *section = index == 0 ? "屏幕布局" :
                           index == 5 ? "高级功能" :
-                          index == 9 ? "同步设置" : NULL;
+                          index == DISPLAY_SYNC_ROW ? "同步设置" : NULL;
     if (section) {
       overlay_fill_rect(panel_x + 24, row_y + 11, 72, 1, 0x33ffffffu);
       overlay_draw_text(panel_x + 108, row_y, COLOR_MUTED, section);
@@ -1639,19 +1835,22 @@ static void render_display(DrasticIngameMenu *menu) {
     const int row_width = panel_width - 48;
     const int selected = menu->content_focused &&
                           menu->selection[MENU_DISPLAY] == index;
-    if (index == 0 || index == 2 || index == 4)
+    if (index == DISPLAY_LAYOUT_ROW || index == DISPLAY_GAP_ROW ||
+        index == DISPLAY_ROTATION_ROW)
       draw_selector_row(row_x, row_y, row_width, selected, labels[index],
                         values[index], 1);
-    else if (index == 1)
+    else if (index == DISPLAY_CUSTOM_LAYOUT_ROW)
       draw_link_row(row_x, row_y, row_width, selected, labels[index],
                     menu->config->layout == DRASTIC_LAYOUT_CUSTOM);
-    else if (index == 3)
+    else if (index == DISPLAY_INTEGER_SCALE_ROW)
       draw_switch_row(row_x, row_y, row_width, selected, labels[index],
                       menu->config->integer_scale, 1);
-    else if (index == 5)
+ #ifdef USE_VULKAN
+    else if (index == DISPLAY_LSFG_ROW)
       draw_switch_row(row_x, row_y, row_width, selected, labels[index],
                       drastic_renderer_lsfg_enabled(), lsfg_allowed);
-    else if (index == 8)
+ #endif
+    else if (index == DISPLAY_CUSTOM_FILTER_ROW)
       draw_link_row(row_x, row_y, row_width, selected, labels[index], 0);
     else
       draw_link_row(row_x, row_y, row_width, selected, labels[index], 1);
@@ -1916,9 +2115,22 @@ static void update_main(DrasticIngameMenu *menu, u64 pressed) {
     case MAIN_RESUME: drastic_menu_close(menu, true); break;
     case MAIN_SAVE_STATES:
     case MAIN_LOAD_STATES:
-    case MAIN_CHEATS:
     case MAIN_DISPLAY:
     case MAIN_EMULATION:
+      menu->content_focused = 1;
+      {
+        const u64 frequency = armGetSystemTickFreq();
+        menu->hint_until = frequency ? armGetSystemTick() + frequency * 3 : 0;
+      }
+      menu->redraw = 1;
+      break;
+    case MAIN_CHEATS:
+      /* Do not enter the content-focus state for an absent database/empty
+       * title: the old path made an empty page consume every input. */
+      if (!menu->cheat_count) {
+        set_status(menu, "未找到可用金手指；请安装 usrcheat.dat 后重试");
+        break;
+      }
       menu->content_focused = 1;
       {
         const u64 frequency = armGetSystemTickFreq();
@@ -1996,12 +2208,16 @@ static void update_cheats(DrasticIngameMenu *menu, u64 pressed) {
     while (parent >= 0) { if (!menu->cheats[parent].expanded) { visible = 0; break; } parent = menu->cheats[parent].parent; }
     if (visible) visible_items[count++] = item;
   }
-  if (!count) return;
-  navigate_list(menu, count, pressed);
   if (pressed & HidNpadButton_B) {
     leave_content_focus(menu);
     return;
   }
+  if (!count) {
+    if (pressed & HidNpadButton_A)
+      set_status(menu, "未找到可用金手指；请安装 usrcheat.dat 后重试");
+    return;
+  }
+  navigate_list(menu, count, pressed);
   const int selected = clamp_int(menu->selection[MENU_CHEATS], 0, count - 1);
   MenuCheat *cheat = &menu->cheats[visible_items[selected]];
   if (cheat->is_category) {
@@ -2227,23 +2443,25 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
     }
     return;
   }
-  navigate_list(menu, 12, pressed);
+  navigate_list(menu, DISPLAY_ITEM_COUNT, pressed);
   if (pressed & HidNpadButton_B) {
     leave_content_focus(menu);
     return;
   }
   const int selection = menu->selection[MENU_DISPLAY];
-  if (selection >= 9 && selection <= 11 && (pressed & HidNpadButton_A)) {
-    menu->confirm_sync = selection - 8;
+  if (selection >= DISPLAY_SYNC_ROW &&
+      selection < DISPLAY_ITEM_COUNT && (pressed & HidNpadButton_A)) {
+    menu->confirm_sync = selection - DISPLAY_SYNC_ROW + 1;
     menu->redraw = 1;
     return;
   }
-  if (selection == 7 && (pressed & HidNpadButton_A)) {
+  if (selection == DISPLAY_OVERLAY_ROW && (pressed & HidNpadButton_A)) {
     menu->overlay_sidebar_focus = 0;
     select_page(menu, MENU_OVERLAY_SIDEBAR);
     return;
   }
-  if (selection == 1 && menu->config->layout == DRASTIC_LAYOUT_CUSTOM &&
+  if (selection == DISPLAY_CUSTOM_LAYOUT_ROW &&
+      menu->config->layout == DRASTIC_LAYOUT_CUSTOM &&
       (pressed & (HidNpadButton_Left | HidNpadButton_Right |
                   HidNpadButton_L | HidNpadButton_R | HidNpadButton_A))) {
     menu->editor_screen = 0;
@@ -2251,7 +2469,8 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
     select_page(menu, MENU_LAYOUT_EDITOR);
     return;
   }
-  if (selection == 5 &&
+ #ifdef USE_VULKAN
+  if (selection == DISPLAY_LSFG_ROW &&
       (pressed & (HidNpadButton_Left | HidNpadButton_Right |
                    HidNpadButton_L | HidNpadButton_R | HidNpadButton_A))) {
     if (!prefs_get_bool("Wrapper/LSFGAllowed", false)) {
@@ -2277,14 +2496,7 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
     menu->redraw = 1;
     return;
   }
-  if (selection == 6 &&
-      (pressed & (HidNpadButton_Left | HidNpadButton_Right |
-                   HidNpadButton_L | HidNpadButton_R | HidNpadButton_A))) {
-    const int direction = (pressed & (HidNpadButton_Left | HidNpadButton_L)) ? -1 :
-                          (pressed & (HidNpadButton_Right | HidNpadButton_R)) ? 1 : 0;
-    begin_filter_picker(menu, 0, direction);
-    return;
-  }
+ #endif
   const int direction = change_direction(pressed);
   if (!direction) return;
   switch (selection) {
@@ -2358,12 +2570,23 @@ static void update_overlay_picker(DrasticIngameMenu *menu, u64 pressed) {
     return;
   }
   if (pressed & HidNpadButton_B) {
+    char parent[1024];
+    if (overlay_parent_directory(menu->overlay_picker_directory, parent,
+                                 sizeof(parent))) {
+      /* Returning from a child keeps that child selected, exactly like the
+       * nds_stub browser's focus-path reload. */
+      char child[sizeof(menu->overlay_picker_directory)];
+      snprintf(child, sizeof(child), "%s", menu->overlay_picker_directory);
+      refresh_overlay_files_in_directory(menu, parent, child);
+      menu->redraw = 1;
+      return;
+    }
     select_page(menu, MENU_OVERLAY_SIDEBAR);
     return;
   }
   if (pressed & HidNpadButton_X) {
     if (menu->overlay_file_count &&
-        !menu->overlay_file_is_directory[menu->overlay_picker_index])
+        !menu->overlay_files[menu->overlay_picker_index].is_directory)
       menu->overlay_preview_visible = 1;
     else
       set_status(menu, "文件夹无法预览，请选择 PNG 文件");
@@ -2380,10 +2603,17 @@ static void update_overlay_picker(DrasticIngameMenu *menu, u64 pressed) {
     menu->redraw = 1;
   if (!(pressed & HidNpadButton_A)) return;
   const int item = menu->overlay_picker_index;
-  const char *path = menu->overlay_files[item];
-  if (menu->overlay_file_is_directory[item]) {
-    refresh_overlay_files_in_directory(menu, path);
-    menu->overlay_preview_visible = 0;
+  const OverlayFileEntry *entry = &menu->overlay_files[item];
+  const char *path = entry->path;
+  if (entry->is_parent) {
+    char child[sizeof(menu->overlay_picker_directory)];
+    snprintf(child, sizeof(child), "%s", menu->overlay_picker_directory);
+    refresh_overlay_files_in_directory(menu, path, child);
+    menu->redraw = 1;
+    return;
+  }
+  if (entry->is_directory) {
+    refresh_overlay_files_in_directory(menu, path, NULL);
     menu->redraw = 1;
     return;
   }
@@ -2648,6 +2878,8 @@ DrasticIngameMenu *drastic_menu_create(DrasticRuntimeConfig *config,
 void drastic_menu_destroy(DrasticIngameMenu *menu) {
   if (!menu) return;
   free_cheats(menu);
+  clear_overlay_files(menu);
+  overlay_preview_clear();
   jni_release_int_array(menu->snapshot_top_array);
   jni_release_int_array(menu->snapshot_bottom_array);
   free(menu);

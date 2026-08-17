@@ -45,7 +45,7 @@ void fatal_error(const char *fmt, ...) {
 
   consoleInit(NULL);
 
-  printf("DrasticDS_nx - fatal error\n\n%s", msg);
+  printf("GBAStation_DrasticDS - fatal error\n\n%s", msg);
 
   printf("\n\nPress A to exit.");
 

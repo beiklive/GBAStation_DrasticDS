@@ -21,3 +21,6 @@ __pycache__/
 **/game_database.xml
 **/usrcheat.dat
 !third_party/nds-i-cheat-databases/usrcheat.dat
+
+build_gl
+build_vk

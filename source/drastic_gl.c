@@ -3,6 +3,7 @@
 #include <switch.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <png.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -971,6 +972,65 @@ void drastic_renderer_shutdown(void) {
 unsigned drastic_renderer_frame_count(void) { return g_frames; }
 unsigned drastic_renderer_capture_count(void) { return g_captures; }
 unsigned drastic_renderer_changed_capture_count(void) { return 0; }
+
+bool drastic_renderer_write_screenshot(const char *path) {
+  if (!path || !path[0] || g_display == EGL_NO_DISPLAY ||
+      g_context == EGL_NO_CONTEXT || !g_texture_width || !g_texture_height)
+    return false;
+
+  const unsigned width = (unsigned)g_texture_width;
+  const unsigned screen_height = (unsigned)g_texture_height;
+  const unsigned height = screen_height * 2;
+  const size_t bytes = (size_t)width * height * 4;
+  uint8_t *rgba = malloc(bytes);
+  uint8_t *row = malloc((size_t)width * 4);
+  if (!rgba || !row) {
+    free(row);
+    free(rgba);
+    return false;
+  }
+
+  GLuint framebuffer = 0;
+  glGenFramebuffers(1, &framebuffer);
+  if (!framebuffer) {
+    free(row);
+    free(rgba);
+    return false;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+  int valid = 1;
+  for (unsigned screen = 0; screen < SCREEN_TEXTURE_COUNT && valid; screen++) {
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g_textures[screen], 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      valid = 0;
+      break;
+    }
+    for (unsigned y = 0; y < screen_height; y++) {
+      glReadPixels(0, (GLint)y, (GLsizei)width, 1, GL_RGBA,
+                   GL_UNSIGNED_BYTE, row);
+      memcpy(rgba + ((size_t)(screen * screen_height +
+                              (screen_height - 1 - y)) * width) * 4,
+             row, (size_t)width * 4);
+    }
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &framebuffer);
+
+  int written = 0;
+  if (valid && glGetError() == GL_NO_ERROR) {
+    png_image image;
+    memset(&image, 0, sizeof(image));
+    image.version = PNG_IMAGE_VERSION;
+    image.width = width;
+    image.height = height;
+    image.format = PNG_FORMAT_RGBA;
+    written = png_image_write_to_file(&image, path, 0, rgba, 0, NULL);
+  }
+  free(row);
+  free(rgba);
+  return written != 0;
+}
 
 bool drastic_renderer_lsfg_available(void) { return false; }
 

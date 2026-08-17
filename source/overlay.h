@@ -22,6 +22,8 @@ void overlay_set_rotation(int rotation);
 bool overlay_set_png_mask(const char *path, bool enabled);
 bool overlay_draw_png_preview(const char *path, int x, int y, int width,
                               int height);
+/* Releases the decoded picker preview.  PNG masks use a separate buffer. */
+void overlay_preview_clear(void);
 int overlay_width(void);
 int overlay_height(void);
 void overlay_begin(void);

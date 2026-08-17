@@ -17,6 +17,15 @@ GBAStationNDSStub.nro <rom-path> --return <launcher.nro>
 leave to Homebrew Menu instead. On normal emulator exit the host schedules the
 return NRO with `envSetNextLoad`.
 
+For direct emulator debugging, build with a fallback ROM path.  That build
+uses this path only when no launcher ROM argument was supplied, so launcher
+launches retain their normal behavior. Direct debug launches return to the
+homebrew environment instead of attempting to reopen GBAStation:
+
+```text
+./build_local.sh --backend vulkan --debug-rom sdmc:/nds/black.nds
+```
+
 Game buttons and hotkeys are read only from the same launcher configuration
 used by `nds_stub`: `sdmc:/GBAStation/config/config.cfg`. The host accepts typed
 records such as `nds.handle.a=s|PAD_A` and `nds.hotkey.menu.pad=s|PAD_LT+PAD_RT`.

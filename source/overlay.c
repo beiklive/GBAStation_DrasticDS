@@ -2,8 +2,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <png.h>
 
@@ -11,6 +14,7 @@
 #include FT_FREETYPE_H
 
 #include "overlay.h"
+#include "drastic_rotation.h"
 
 static uint32_t g_pixels[DRASTIC_OVERLAY_PIXELS];
 static uint32_t g_mask_pixels[DRASTIC_OVERLAY_PIXELS];
@@ -32,6 +36,14 @@ static int g_hud_fps_tenth = -2;
 static int g_hud_fast_forward = -1;
 static int g_mask_enabled;
 static char g_mask_path[1024];
+static png_bytep g_preview_pixels;
+static unsigned g_preview_width;
+static unsigned g_preview_height;
+static char g_preview_path[1024];
+/* The renderer rotates the complete overlay texture together with the DS
+ * screens.  PNG masks are display-space artwork, so load them with the
+ * inverse transform and keep their final on-screen orientation fixed. */
+static int g_rotation;
 
 static uint32_t composite_argb(uint32_t destination, uint32_t source);
 
@@ -89,14 +101,25 @@ void overlay_init(int rotation) {
   memset(g_mask_pixels, 0, sizeof(g_mask_pixels));
   g_mask_enabled = 0;
   g_mask_path[0] = '\0';
+  g_rotation = rotation & 3;
 }
 
 void overlay_set_rotation(int rotation) {
+  const int next_rotation = rotation & 3;
+  const int rotation_changed = g_rotation != next_rotation;
+  g_rotation = next_rotation;
   const int width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
                                    : DRASTIC_OVERLAY_WIDTH;
   const int height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
                                     : DRASTIC_OVERLAY_HEIGHT;
-  if (g_frame.width == width && g_frame.height == height) return;
+  if (g_frame.width == width && g_frame.height == height) {
+    if (rotation_changed && g_mask_path[0]) {
+      char path[sizeof(g_mask_path)];
+      snprintf(path, sizeof(path), "%s", g_mask_path);
+      overlay_set_png_mask(path, true);
+    }
+    return;
+  }
   g_frame.width = width;
   g_frame.height = height;
   memset(g_pixels, 0, sizeof(g_pixels));
@@ -137,9 +160,23 @@ bool overlay_set_png_mask(const char *path, bool enabled) {
     return false;
   }
   for (int y = 0; y < g_frame.height; y++) {
-    const unsigned source_y = (unsigned)y * image.height / (unsigned)g_frame.height;
     for (int x = 0; x < g_frame.width; x++) {
-      const unsigned source_x = (unsigned)x * image.width / (unsigned)g_frame.width;
+      /* Texture coordinates are rotated by the renderer.  Map this texture
+       * location back to physical display coordinates before sampling the
+       * mask PNG, so the PNG itself does not rotate with the NDS image. */
+      float display_u, display_v;
+      drastic_rotation_source_to_display(
+          g_rotation, ((float)x + 0.5f) / (float)g_frame.width,
+          ((float)y + 0.5f) / (float)g_frame.height,
+          &display_u, &display_v);
+      if (display_u < 0.0f) display_u = 0.0f;
+      if (display_u > 1.0f) display_u = 1.0f;
+      if (display_v < 0.0f) display_v = 0.0f;
+      if (display_v > 1.0f) display_v = 1.0f;
+      unsigned source_x = (unsigned)(display_u * image.width);
+      unsigned source_y = (unsigned)(display_v * image.height);
+      if (source_x >= image.width) source_x = image.width - 1;
+      if (source_y >= image.height) source_y = image.height - 1;
       const png_byte *pixel = source +
           ((size_t)source_y * image.width + source_x) * 4;
       g_mask_pixels[(size_t)y * g_frame.width + x] =
@@ -156,13 +193,29 @@ bool overlay_set_png_mask(const char *path, bool enabled) {
   return true;
 }
 
-bool overlay_draw_png_preview(const char *path, int x, int y, int width,
-                              int height) {
-  if (!path || !path[0] || width <= 0 || height <= 0) return false;
+void overlay_preview_clear(void) {
+  free(g_preview_pixels);
+  g_preview_pixels = NULL;
+  g_preview_width = 0;
+  g_preview_height = 0;
+  g_preview_path[0] = '\0';
+}
+
+static bool overlay_load_png_preview(const char *path) {
+  if (!path || !path[0]) return false;
+  if (g_preview_pixels && !strcmp(g_preview_path, path)) return true;
+  overlay_preview_clear();
+  struct stat info;
+  if (stat(path, &info) != 0 || info.st_size <= 0 ||
+      (uint64_t)info.st_size > 64ULL * 1024ULL * 1024ULL) return false;
   png_image image;
   memset(&image, 0, sizeof(image));
   image.version = PNG_IMAGE_VERSION;
   if (!png_image_begin_read_from_file(&image, path)) return false;
+  if (!image.width || !image.height || image.width > 4096 || image.height > 4096) {
+    png_image_free(&image);
+    return false;
+  }
   image.format = PNG_FORMAT_RGBA;
   const size_t bytes = PNG_IMAGE_SIZE(image);
   png_bytep source = malloc(bytes);
@@ -173,19 +226,55 @@ bool overlay_draw_png_preview(const char *path, int x, int y, int width,
     png_image_free(&image);
     return false;
   }
+  /* nds_stub keeps previews below one screen of pixels.  Keeping the same
+   * ceiling avoids a 4K PNG becoming a persistent memory allocation here. */
+  unsigned target_width = image.width;
+  unsigned target_height = image.height;
+  const uint64_t maximum_pixels = (uint64_t)DRASTIC_OVERLAY_WIDTH *
+                                  DRASTIC_OVERLAY_HEIGHT;
+  if ((uint64_t)target_width * target_height > maximum_pixels) {
+    const double scale = sqrt((double)maximum_pixels /
+                              ((double)target_width * target_height));
+    target_width = (unsigned)(target_width * scale);
+    target_height = (unsigned)(target_height * scale);
+    if (!target_width) target_width = 1;
+    if (!target_height) target_height = 1;
+  }
+  g_preview_pixels = malloc((size_t)target_width * target_height * 4);
+  if (!g_preview_pixels) {
+    free(source);
+    png_image_free(&image);
+    return false;
+  }
+  for (unsigned row = 0; row < target_height; row++)
+    for (unsigned column = 0; column < target_width; column++) {
+      const unsigned source_x = column * image.width / target_width;
+      const unsigned source_y = row * image.height / target_height;
+      memcpy(g_preview_pixels + ((size_t)row * target_width + column) * 4,
+             source + ((size_t)source_y * image.width + source_x) * 4, 4);
+    }
+  free(source);
+  png_image_free(&image);
+  g_preview_width = target_width;
+  g_preview_height = target_height;
+  snprintf(g_preview_path, sizeof(g_preview_path), "%s", path);
+  return true;
+}
+
+bool overlay_draw_png_preview(const char *path, int x, int y, int width,
+                              int height) {
+  if (width <= 0 || height <= 0 || !overlay_load_png_preview(path)) return false;
   for (int row = 0; row < height; row++) {
-    const unsigned source_y = (unsigned)row * image.height / (unsigned)height;
+    const unsigned source_y = (unsigned)row * g_preview_height / (unsigned)height;
     for (int column = 0; column < width; column++) {
-      const unsigned source_x = (unsigned)column * image.width / (unsigned)width;
-      const png_byte *pixel = source +
-          ((size_t)source_y * image.width + source_x) * 4;
+      const unsigned source_x = (unsigned)column * g_preview_width / (unsigned)width;
+      const png_byte *pixel = g_preview_pixels +
+          ((size_t)source_y * g_preview_width + source_x) * 4;
       const uint32_t color = ((uint32_t)pixel[3] << 24) |
           ((uint32_t)pixel[0] << 16) | ((uint32_t)pixel[1] << 8) | pixel[2];
       overlay_fill_rect(x + column, y + row, 1, 1, color);
     }
   }
-  free(source);
-  png_image_free(&image);
   return true;
 }
 

@@ -280,6 +280,8 @@ def main() -> int:
                         help="APK assets/shaders directory")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--glslang", required=True, type=Path)
+    parser.add_argument("--skip-vulkan", action="store_true",
+                        help="generate and validate GLES filters only")
     args = parser.parse_args()
 
     if not args.source.is_dir():
@@ -303,7 +305,7 @@ def main() -> int:
         vertex, fragment = sources[spec.name]
         validate_opengl(args.glslang, data_output, spec.name,
                         vertex, fragment)
-        if spec.name in VULKAN_PROGRAMS:
+        if not args.skip_vulkan and spec.name in VULKAN_PROGRAMS:
             compile_vulkan(args.glslang, data_output, spec.name,
                            vertex, fragment, sampler_map[spec.name])
 

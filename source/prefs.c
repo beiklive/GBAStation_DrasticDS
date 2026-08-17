@@ -176,6 +176,21 @@ static void import_launcher_core_config(void) {
   }
 }
 
+/* Save handling is shared by all NDS cores.  Its source of truth is the
+ * launcher's global `save.*` contract, not a DraStic-specific core setting.
+ * The values use the same convention as nds_stub: 0 disables the action and
+ * 1..10 select state slots 0..9.  Read this after a per-game launch profile
+ * so an older profile cannot resurrect a stale autosave-on-exit choice. */
+static void import_launcher_save_config(void) {
+  char value[PREFS_VAL_LEN];
+  if (launcher_config_value("save.autoSaveOnExit", value, sizeof(value))) {
+    put_entry("Drastic/AutoSaveOnExit", value);
+  } else {
+    /* BeikLiveStation's real default is disabled. */
+    put_entry("Drastic/AutoSaveOnExit", "0");
+  }
+}
+
 /* BeikLiveStation writes this one-shot profile immediately before it transfers
  * control to the NRO.  The ROM guard prevents an older profile from affecting
  * a direct launch, or a launch from another frontend. */
@@ -267,6 +282,8 @@ static void seed_defaults(void) {
   seed("Drastic/Blend", "false");
   seed("Drastic/RawSaveFormat", "false");
   seed("Drastic/AutosaveInterval", "300");
+  /* The launcher-owned save.autoSaveOnExit setting is imported below. */
+  seed("Drastic/AutoSaveOnExit", "0");
   seed("Drastic/FirmwareNickname", "Switch");
   seed("Drastic/FirmwareLanguage", "-1");
   seed("Drastic/FirmwareColor", "0");
@@ -318,12 +335,20 @@ void prefs_init(const char *path) {
   migrate_fast_forward_speed();
   import_launcher_core_config();
   import_game_launch_profile();
+  import_launcher_save_config();
   /* Older launcher builds materialized their UI fallback of 200% into
    * config.cfg.  It is not an explicit user choice, so migrate that legacy
    * default after every import; other selected rates remain untouched. */
   if (prefs_get_int("Drastic/FastForwardSpeed", 5) == 2)
     put_entry("Drastic/FastForwardSpeed", "5");
-  /* This Vulkan host always runs DraStic's 3D engine at 2x.  The core has no
+#ifndef USE_VULKAN
+  /* LSFG is compiled only into the switchVK host.  Do not allow a shared
+   * launcher config.cfg or an older drastic.ini to expose a non-functional
+   * frame-generation toggle in the OpenGL build. */
+  put_entry("Wrapper/LSFGAllowed", "false");
+  put_entry("Wrapper/LSFGEnabled", "false");
+#endif
+  /* Both renderer hosts always run DraStic's 3D engine at 2x.  The core has no
    * higher multiplier and this intentionally overrides stale launcher data. */
   put_entry("Drastic/Hires3D", "true");
   /* The shared NDS save directory is also consumed by nds_stub.  DraStic's
@@ -339,7 +364,7 @@ void prefs_save(void) {
   snprintf(temporary, sizeof(temporary), "%s.tmp", ini_path);
   FILE *file = fopen(temporary, "wb");
   if (!file) return;
-  fputs("# DrasticDS_nx launch configuration\n", file);
+  fputs("# GBAStation_DrasticDS launch configuration\n", file);
   for (int index = 0; index < entry_count; index++)
     fprintf(file, "%s = %s\n", entries[index].key, entries[index].value);
   int failed = fflush(file) != 0;

@@ -3,6 +3,8 @@
  * fstat()s the opened synthetic render-node descriptor.  Newlib dispatches an
  * unknown descriptor through a null devoptab entry, which faults at PC=0. */
 
+#ifdef USE_VULKAN
+
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -19,3 +21,5 @@ int __wrap_fstat(int fd, struct stat *status) {
   status->st_nlink = 1;
   return 0;
 }
+
+#endif /* USE_VULKAN */

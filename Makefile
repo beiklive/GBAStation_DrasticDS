@@ -10,31 +10,29 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-TARGET		:=	GBAStationNDSStub
+RENDERER	?=	vulkan
+ifeq ($(RENDERER),vulkan)
+TARGET		?=	GBAStationNDSStub
+BUILD		?=	build_vk
+else ifeq ($(RENDERER),opengl)
+TARGET		?=	GBAStationNDSStubGL
+BUILD		?=	build_gl
+else
+$(error "RENDERER must be vulkan or opengl (got '$(RENDERER)')")
+endif
 APP_TITLE	:=	GBAStation Drastic Stub
 APP_AUTHOR	:=	beiklive
 APP_VERSION	:=	0.0.1
-BUILD		:=	build
-SOURCES		:=	source source/hooks source/lsfg \
-			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
-			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
-			third_party/lsfg-vk/lsfg-vk-backend/src \
-			third_party/lsfg-vk/lsfg-vk-backend/src/extraction \
-			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
-			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
+SOURCES		:=	source source/hooks
 DATA		:=	data
-INCLUDES	:=	source source/lsfg $(PORTLIBS)/include/freetype2 \
-			third_party/lsfg-vk/lsfg-vk-common/include \
-			third_party/lsfg-vk/lsfg-vk-backend/include \
-			third_party/lsfg-vk/lsfg-vk-backend/src
+INCLUDES	:=	source $(PORTLIBS)/include/freetype2
 # The 26.1.4 consumer SDK packages NVK together with its required Switch
 # compatibility shims.  A different SDK can still be selected via VULKAN_SDK.
 VULKAN_SDK ?= $(abspath $(TOPDIR)/../switchVK/nvk-switch-26.1.4)
 DFX_GENERATED ?=
+DFX_DATA ?= $(DFX_GENERATED)/data
 ifneq ($(strip $(DFX_GENERATED)),)
-DATA		+=	$(DFX_GENERATED)/data
 INCLUDES	+=	$(DFX_GENERATED)/include
-SOURCES		+=	$(DFX_GENERATED)/src
 endif
 
 #---------------------------------------------------------------------------------
@@ -45,13 +43,40 @@ OPTIMIZATION := -O3 -flto=auto
 
 # __SWITCH__ for libnx; DRASTIC_NX gates the port-specific host branches.
 DEFINES	:=	-D__SWITCH__ -D_GNU_SOURCE -DDRASTIC_NX -DDRASTIC_NX_VERSION='"$(APP_VERSION)"'
+ifneq ($(strip $(DEBUG_ROM_PATH)),)
+# Used only by a deliberately requested debug build.  Normal builds continue
+# to require the launcher to supply a ROM path.
+DEFINES	+=	-DDRASTIC_DEBUG_ROM_PATH='"$(DEBUG_ROM_PATH)"'
+endif
 ifneq ($(strip $(DFX_GENERATED)),)
 DEFINES	+=	-DDRASTIC_DFX_GENERATED
 endif
 
+ifeq ($(RENDERER),vulkan)
 # NVK Vulkan host. DraStic's GLES texture uploads are captured and presented
 # through Vulkan, so switch-mesa EGL/GLES must not be linked into this build.
 DEFINES	+=	-DUSE_VULKAN -DVK_USE_PLATFORM_VI_NN
+SOURCES		+=	source/lsfg \
+			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
+			third_party/lsfg-vk/lsfg-vk-backend/src \
+			third_party/lsfg-vk/lsfg-vk-backend/src/extraction \
+			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
+INCLUDES	+=	source/lsfg \
+			third_party/lsfg-vk/lsfg-vk-common/include \
+			third_party/lsfg-vk/lsfg-vk-backend/include \
+			third_party/lsfg-vk/lsfg-vk-backend/src
+ifneq ($(strip $(DFX_GENERATED)),)
+DATA		+=	$(DFX_DATA)
+SOURCES		+=	$(DFX_GENERATED)/src
+endif
+else
+DEFINES	+=	-DUSE_OPENGL
+ifneq ($(strip $(DFX_GENERATED)),)
+DATA		+=	$(DFX_DATA)
+endif
+endif
 
 CFLAGS	:=	-Wall -Wextra $(OPTIMIZATION) -DNDEBUG -ffunction-sections -fdata-sections \
 			-fno-ident -ffile-prefix-map=$(CURDIR)=. \
@@ -63,6 +88,7 @@ ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(OPTIMIZATION) -Wl,-Map,$(notdir $*.map) \
 			-Wl,--gc-sections -Wl,--build-id=sha1 -Wl,--allow-multiple-definition
 
+ifeq ($(RENDERER),vulkan)
 # switchVK exports a self-contained libvulkan.a. It owns Mesa/NVK and its
 # generated Vulkan runtime, and must remain mutually exclusive with Mesa EGL.
 LIBDIRS	:= $(VULKAN_SDK) $(PORTLIBS) $(LIBNX)
@@ -72,6 +98,14 @@ LIBS	:= -Wl,--whole-archive -lvulkan -Wl,--no-whole-archive \
 		-Wl,--wrap=fstat \
 		-lminizip -lfreetype -lharfbuzz -lpng16 -lbz2 \
 		-lz -lzstd -lnx -lstdc++ -lm
+else
+# The original DraStic GLES host runs through switch-mesa. Never co-link these
+# libraries with switchVK/NVK: both carry incompatible Mesa object code.
+LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+LIBS	:= -lEGL -lGLESv2 -lglapi -ldrm_nouveau \
+		-lminizip -lfreetype -lharfbuzz -lpng16 -lbz2 \
+		-lz -lzstd -lnx -lstdc++ -lm
+endif
 
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -121,7 +155,7 @@ ifneq ($(APP_TITLEID),)
 	export NACPFLAGS += --titleid=$(APP_TITLEID)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) clean clean-all all
 
 #---------------------------------------------------------------------------------
 all: $(BUILD)
@@ -133,7 +167,14 @@ $(BUILD):
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf \
+	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+	@rm -f $(TARGET).map
+
+clean-all:
+	@echo clean all ...
+	@rm -fr build build_vk build_gl \
+		GBAStationNDSStub.nro GBAStationNDSStub.nacp GBAStationNDSStub.elf \
+		GBAStationNDSStubGL.nro GBAStationNDSStubGL.nacp GBAStationNDSStubGL.elf \
 		GBAStationDrasticStub.nro GBAStationDrasticStub.elf GBAStationDrasticStub.map
 	@rm -f *.o
 
