@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1578,21 +1579,35 @@ static int overlay_file_compare(const void *left, const void *right) {
 }
 
 static int refresh_overlay_files_in_directory(DrasticIngameMenu *menu,
-                                              const char *directory,
-                                              const char *focus_path) {
+                                               const char *directory,
+                                               const char *focus_path) {
+  /* `directory` can be an OverlayFileEntry::path.  Copy it before clearing
+   * the entries below: clear_overlay_files() releases that allocation.  The
+   * old ordering was a use-after-free when entering a folder with A, causing
+   * an invalid directory name, an empty list, and then a misleading "no PNG"
+   * message.  The same defensive copy also handles reloads whose source is
+   * overlay_picker_directory itself. */
+  char requested_directory[sizeof(menu->overlay_picker_directory)];
+  snprintf(requested_directory, sizeof(requested_directory), "%s",
+           directory && directory[0] ? directory : "sdmc:/GBAStation/overlays");
   clear_overlay_files(menu);
   overlay_preview_clear();
   menu->overlay_preview_visible = 0;
   menu->overlay_picker_index = 0;
   menu->scroll[MENU_OVERLAY_PICKER] = 0;
   snprintf(menu->overlay_picker_directory, sizeof(menu->overlay_picker_directory),
-           "%s", directory ? directory : "sdmc:/GBAStation/overlays");
+           "%s", requested_directory);
   char parent[1024];
   if (overlay_parent_directory(menu->overlay_picker_directory, parent,
                                sizeof(parent)))
     (void)add_overlay_file(menu, "..", parent, 1, 1, NULL);
   DIR *dir = opendir(menu->overlay_picker_directory);
-  if (!dir) return 0;
+  if (!dir) {
+    debug_logf("overlay picker open failed dir=%s errno=%d",
+               menu->overlay_picker_directory, errno);
+    set_status(menu, "无法打开该文件夹");
+    return 0;
+  }
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
@@ -1601,10 +1616,12 @@ static int refresh_overlay_files_in_directory(DrasticIngameMenu *menu,
              menu->overlay_picker_directory[strlen(menu->overlay_picker_directory) - 1] == '/'
                  ? "" : "/", entry->d_name);
     struct stat info;
-    if (!stat(path, &info) && S_ISDIR(info.st_mode))
+    const int stat_ok = stat(path, &info) == 0;
+    if (stat_ok && S_ISDIR(info.st_mode))
       (void)add_overlay_file(menu, entry->d_name, path, 1, 0, &info);
     else if (has_png_extension(entry->d_name))
-      (void)add_overlay_file(menu, entry->d_name, path, 0, 0, &info);
+      (void)add_overlay_file(menu, entry->d_name, path, 0, 0,
+                             stat_ok ? &info : NULL);
   }
   closedir(dir);
   qsort(menu->overlay_files, (size_t)menu->overlay_file_count,
@@ -1617,6 +1634,9 @@ static int refresh_overlay_files_in_directory(DrasticIngameMenu *menu,
       }
     }
   }
+  debug_logf("overlay picker entries dir=%s count=%d focus=%d",
+             menu->overlay_picker_directory, menu->overlay_file_count,
+             menu->overlay_picker_index);
   return 1;
 }
 
@@ -2604,7 +2624,10 @@ static void update_overlay_picker(DrasticIngameMenu *menu, u64 pressed) {
   if (!(pressed & HidNpadButton_A)) return;
   const int item = menu->overlay_picker_index;
   const OverlayFileEntry *entry = &menu->overlay_files[item];
-  const char *path = entry->path;
+  /* refresh_overlay_files_in_directory() releases overlay_files, so never
+   * pass an entry-owned pointer into it. */
+  char path[1024];
+  snprintf(path, sizeof(path), "%s", entry->path ? entry->path : "");
   if (entry->is_parent) {
     char child[sizeof(menu->overlay_picker_directory)];
     snprintf(child, sizeof(child), "%s", menu->overlay_picker_directory);
